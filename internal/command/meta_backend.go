@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log"
 	"maps"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -42,7 +41,6 @@ import (
 	"github.com/hashicorp/terraform/internal/didyoumean"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/internal/getproviders/providerreqs"
-	"github.com/hashicorp/terraform/internal/getproviders/reattach"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
@@ -1416,8 +1414,10 @@ func (m *Meta) determineStateStoreInitReason(cfgState *workdir.StateStoreConfigS
 		}, diags
 	}
 
-	// We need the state store schema to do our comparisons here.
+	// We need the provider and state store schemas for use in comparisons here.
+	// Launch, use, and close an instance of the state store.
 	ssBackend, ssCfgVal, pCfgVal, ssDiags := m.stateStoreInitFromConfig(cfg, pLocks)
+	defer ssBackend.Close()
 	if ssDiags.HasErrors() {
 		return nil, ssDiags
 	}
@@ -2092,19 +2092,12 @@ func (m *Meta) backend(configPath string, viewType arguments.ViewType) (backendr
 			ViewType:      viewType,
 		}
 	case root.StateStore != nil:
-		// Annotate state_store config representation with info about how the provider
-		// is supplied to Terraform.
-		isReattached, err := reattach.IsProviderReattached(root.StateStore.ProviderAddr, os.Getenv("TF_REATTACH_PROVIDERS"))
-		if err != nil {
-			panic(fmt.Sprintf("Unable to determine if provider %s is reattached while initializing the state store. This is a bug in Terraform and should be reported: %v", root.StateStore.ProviderAddr.ForDisplay(), err))
-		}
-		root.StateStore.ProviderSupplyMode = getproviders.DetermineProviderSupplyMode(m.isProviderDevOverride(root.StateStore.ProviderAddr), isReattached, root.StateStore.ProviderAddr.IsBuiltIn())
-
 		// Check the provider for state storage is present, either via the dependency lock file or
 		// supplied via developer overrides, reattach config, or being built-in.
 		//
 		// Remember, the (Meta).backend method is used for non-init commands, so we expect dependency locks
 		// to be present or for the provider to be otherwise available, e.g. via reattach config.
+		root.StateStore.ProviderSupplyMode = m.getProviderSupplyModeForStateStore(root)
 		depsDiags := root.StateStore.VerifyDependencySelection(locks, root.ProviderRequirements, root.StateStore.ProviderSupplyMode)
 		diags = diags.Append(depsDiags)
 		if depsDiags.HasErrors() {
@@ -2258,6 +2251,7 @@ func (m *Meta) stateStore_C_s(c *configs.StateStore, stateStoreHash int, backend
 		return nil, diags
 	}
 
+	s.Backend = nil // unset this; user may be running `terraform init -reconfigure` and there's a preexisting backend state file.
 	s.StateStore = &workdir.StateStoreConfigState{
 		Type: c.Type,
 		Hash: uint64(stateStoreHash),
@@ -2379,8 +2373,10 @@ func (m *Meta) stateStoreConfigNeedsMigration(cfg *configs.StateStore, cfgState 
 		return true
 	}
 
-	// We need the state store schema to do our comparisons here.
+	// We need the provider and state store schemas for use in comparisons here.
+	// Launch, use, and close an instance of the state store.
 	ssBackend, ssCfgVal, pCfgVal, ssDiags := m.stateStoreInitFromConfig(cfg, opts.Locks)
+	defer ssBackend.Close()
 	if ssDiags.HasErrors() {
 		log.Printf("[ERROR] Unable to initialise state store: %s", ssDiags)
 		return true

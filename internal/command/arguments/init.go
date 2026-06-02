@@ -4,7 +4,9 @@
 package arguments
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -75,6 +77,8 @@ type Init struct {
 
 	Args []string
 
+	StateStoreProviderLockFile string
+
 	// The -enable-pluggable-state-storage-experiment flag is used in control flow logic in the init command.
 	// TODO(SarahFrench/radeksimko): Remove this once the feature is no longer
 	// experimental
@@ -112,6 +116,7 @@ func ParseInit(args []string, experimentsEnabled bool) (*Init, tfdiags.Diagnosti
 	cmdFlags.BoolVar(&init.Json, "json", false, "json")
 	cmdFlags.Var(&init.BackendConfig, "backend-config", "")
 	cmdFlags.Var(&init.PluginPath, "plugin-dir", "plugin directory")
+	cmdFlags.StringVar(&init.StateStoreProviderLockFile, "state-provider-lock-file", "", "path to the dependency lock file used to establish trust in the provider used for state storage. This flag can only be supplied when input is disabled. Defaults to the working directory's .terraform.lock.hcl file.")
 
 	// Used for enabling experimental code that's invoked before configuration is parsed.
 	cmdFlags.BoolVar(&init.EnablePssExperiment, "enable-pluggable-state-storage-experiment", false, "Enable the pluggable state storage experiment")
@@ -137,6 +142,57 @@ func ParseInit(args []string, experimentsEnabled bool) (*Init, tfdiags.Diagnosti
 				"Terraform cannot use the -enable-pluggable-state-storage-experiment flag (or TF_ENABLE_PLUGGABLE_STATE_STORAGE environment variable) unless experiments are enabled.",
 			))
 		}
+		if init.StateStoreProviderLockFile != "" {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Cannot use -state-provider-lock-file flag without experiments enabled",
+				"Terraform cannot use the -state-provider-lock-file flag unless experiments are enabled.",
+			))
+		}
+	}
+
+	if !init.EnablePssExperiment && init.StateStoreProviderLockFile != "" {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Cannot use -state-provider-lock-file flag unless the pluggable state storage experiment is enabled",
+			"Terraform cannot use the -state-provider-lock-file flag unless the pluggable state storage experiment is enabled. Add the -enable-pluggable-state-storage-experiment flag to your command.",
+		))
+	}
+
+	if init.StateStoreProviderLockFile != "" {
+		if init.InputEnabled {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Cannot use -state-provider-lock-file flag when input is enabled",
+				"The -state-provider-lock-file flag is only intended to be used when input is disabled. Either remove the flag or add -input=false to your command.",
+			))
+		}
+		if init.Upgrade {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"The -state-provider-lock-file and -upgrade options are mutually-exclusive",
+				"The -upgrade flag causes Terraform to ignore prior dependency locks, so it cannot be used in conjunction with the -state-provider-lock-file flag. Remove one flag and try again.",
+			))
+		}
+
+		// Validate that the path uses the expected file name: .terraform.lock.hcl
+		srcFilename := filepath.Base(init.StateStoreProviderLockFile)
+		if srcFilename != lockFileName {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Invalid -state-provider-lock-file value",
+				fmt.Sprintf("Expected lock file name to be %s, got: %s", lockFileName, srcFilename),
+			))
+		}
+
+		// Validate that the file exists
+		if _, err := os.Stat(init.StateStoreProviderLockFile); os.IsNotExist(err) {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Lock file supplied by -state-provider-lock-file does not exist",
+				fmt.Sprintf("Terraform cannot find the dependency lock file at %s. Please ensure the file exists and the path is correct.", init.StateStoreProviderLockFile),
+			))
+		}
 	}
 
 	if init.MigrateState && init.Json {
@@ -153,6 +209,12 @@ func ParseInit(args []string, experimentsEnabled bool) (*Init, tfdiags.Diagnosti
 			"Invalid init options",
 			"The -migrate-state and -reconfigure options are mutually-exclusive.",
 		))
+	}
+
+	if init.Upgrade && init.Lockfile == "readonly" {
+		// This is appended as a Go error because this validation already existed this way
+		// and it's been moved earlier in the process, to the arguments package.
+		diags = diags.Append(fmt.Errorf("The -upgrade flag conflicts with -lockfile=readonly."))
 	}
 
 	init.Args = cmdFlags.Args()

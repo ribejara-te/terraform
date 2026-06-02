@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -81,26 +82,8 @@ func (n *NodeDestroyResourceInstance) ModifyCreateBeforeDestroy(v bool) error {
 
 // GraphNodeReferenceable, overriding NodeAbstractResource
 func (n *NodeDestroyResourceInstance) ReferenceableAddrs() []addrs.Referenceable {
-	normalAddrs := n.NodeAbstractResourceInstance.ReferenceableAddrs()
-	destroyAddrs := make([]addrs.Referenceable, len(normalAddrs))
-
-	phaseType := addrs.ResourceInstancePhaseDestroy
-	if n.CreateBeforeDestroy() {
-		phaseType = addrs.ResourceInstancePhaseDestroyCBD
-	}
-
-	for i, normalAddr := range normalAddrs {
-		switch ta := normalAddr.(type) {
-		case addrs.Resource:
-			destroyAddrs[i] = ta.Phase(phaseType)
-		case addrs.ResourceInstance:
-			destroyAddrs[i] = ta.Phase(phaseType)
-		default:
-			destroyAddrs[i] = normalAddr
-		}
-	}
-
-	return destroyAddrs
+	// a destroy node is not referenceable
+	return []addrs.Referenceable{}
 }
 
 // GraphNodeReferencer, overriding NodeAbstractResource
@@ -156,15 +139,8 @@ func (n *NodeDestroyResourceInstance) managedResourceExecute(ctx EvalContext) (d
 	var changeApply *plans.ResourceInstanceChange
 	var state *states.ResourceInstanceObject
 
-	_, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
-	diags = diags.Append(err)
-	if diags.HasErrors() {
-		return diags
-	}
-
-	changeApply, err = n.readDiff(ctx, providerSchema)
-	diags = diags.Append(err)
-	if changeApply == nil || diags.HasErrors() {
+	changeApply = ctx.Changes().GetResourceInstanceChange(n.Addr, addrs.NotDeposed)
+	if changeApply == nil {
 		return diags
 	}
 
@@ -213,9 +189,25 @@ func (n *NodeDestroyResourceInstance) managedResourceExecute(ctx EvalContext) (d
 	// we don't return immediately here on error, so that the state can be
 	// finalized
 
-	err = n.writeResourceInstanceState(ctx, state, workingState)
+	err := n.writeResourceInstanceState(ctx, state, workingState)
 	if err != nil {
 		return diags.Append(err)
+	}
+
+	if policyGraph := ctx.PolicyGraph(); policyGraph != nil {
+		after := cty.NilVal
+		if state != nil {
+			after = state.Value
+		}
+		// The resource has been destroyed, so we add a policy node to send its data
+		// for policy evaluation.
+		policyGraph.Add(&nodeResourcePolicy{
+			ResourceAddr: changeApply.Addr,
+			ProviderAddr: changeApply.ProviderAddr,
+			Before:       changeApply.Before,
+			After:        after,
+			Action:       changeApply.Action,
+		})
 	}
 
 	// create the err value for postApplyHook

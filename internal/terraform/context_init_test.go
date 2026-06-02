@@ -93,7 +93,7 @@ module "example2" {
 				SourceAddr: mustModuleSource(t, "terraform-iaac/cert-manager/kubernetes"),
 			}, {
 				SourceAddr:        mustModuleSource(t, "terraform-aws-modules/vpc/aws"),
-				VersionConstraint: mustVersionContraint(t, "= 6.6.0"),
+				VersionConstraint: mustVersionContraint(t, "6.6.0"),
 			}},
 		},
 
@@ -138,12 +138,12 @@ module "example" {
 				// that this may be caused by a non-const variable used during init.
 				return tfdiags.Diagnostics{}.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  `Invalid module source`,
-					Detail:   "The value of a reference in the module source is unknown." + constVariableDetail,
+					Summary:  `Unknown module source`,
+					Detail:   `Only literal values and const variables can be evaluated during init.`,
 					Subject: &hcl.Range{
 						Filename: filepath.Join(m.SourceDir, "main.tf"),
-						Start:    hcl.Pos{Line: 6, Column: 27, Byte: 82},
-						End:      hcl.Pos{Line: 6, Column: 35, Byte: 90},
+						Start:    hcl.Pos{Line: 6, Column: 14, Byte: 69},
+						End:      hcl.Pos{Line: 6, Column: 37, Byte: 92},
 					},
 				})
 			},
@@ -214,8 +214,7 @@ module "example2" {
 			},
 
 			expectLoadModuleCalls: []*configs.ModuleRequest{{
-				SourceAddr:        mustModuleSource(t, "terraform-iaac/cert-manager/kubernetes"),
-				VersionConstraint: mustVersionContraint(t, ">= 1.2.3"),
+				SourceAddr: mustModuleSource(t, "terraform-iaac/cert-manager/kubernetes"),
 			}},
 		},
 
@@ -625,12 +624,12 @@ module "nested" {
 				// that this may be caused by a non-const variable used during init.
 				return tfdiags.Diagnostics{}.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  `Invalid module source`,
-					Detail:   "The value of a reference in the module source is unknown." + constVariableDetail,
+					Summary:  `Unknown module source`,
+					Detail:   `Only literal values and const variables can be evaluated during init.`,
 					Subject: &hcl.Range{
 						Filename: filepath.Join(mc["./modules/example"].SourceDir, "main.tf"),
-						Start:    hcl.Pos{Line: 7, Column: 27, Byte: 82},
-						End:      hcl.Pos{Line: 7, Column: 35, Byte: 90},
+						Start:    hcl.Pos{Line: 7, Column: 14, Byte: 69},
+						End:      hcl.Pos{Line: 7, Column: 37, Byte: 92},
 					},
 				})
 			},
@@ -697,22 +696,129 @@ module "example" {
 		"non-const variable validation does not run during init": {
 			module: map[string]string{
 				"main.tf": `
+variable "some" {
+ type = string
+}
 variable "name" {
   type    = string
   default = "bad"
 
   validation {
-    condition     = var.name != "bad"
+    condition     = var.name != var.some
     error_message = "must not be bad"
   }
 }
 module "example" {
-    source = "./modules/fixed"
+    source = "./modules/example"
+
+    name = var.name
+}
+`,
+			},
+			mockedLoadModuleCalls: map[string]map[string]string{
+				"./modules/example": {
+					"main.tf": `
+variable "name" {
+  type = string
+}
+`},
+			},
+			expectLoadModuleCalls: []*configs.ModuleRequest{{
+				SourceAddr: mustModuleSource(t, "./modules/example"),
+			}},
+		},
+
+		"registry with version and local with null version": {
+			module: map[string]string{
+				"main.tf": `
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+}
+
+module "local" {
+  source  = "./modules/local"
+  version = null
 }
 `,
 			},
 			expectLoadModuleCalls: []*configs.ModuleRequest{{
-				SourceAddr: mustModuleSource(t, "./modules/fixed"),
+				SourceAddr: mustModuleSource(t, "./modules/local"),
+			}, {
+				SourceAddr:        mustModuleSource(t, "terraform-aws-modules/vpc/aws"),
+				VersionConstraint: mustVersionContraint(t, "~> 5.0"),
+			}},
+		},
+
+		"conditional version with mixed sources - null on local": {
+			module: map[string]string{
+				"main.tf": `
+variable "use_local" {
+  type  = bool
+  const = true
+}
+
+locals {
+  source = var.use_local ? "./modules/local" : "terraform-aws-modules/vpc/aws"
+}
+
+module "example" {
+  source  = local.source
+  version = var.use_local ? null : "5.0.0"
+}
+`,
+			},
+			vars: InputValues{
+				"use_local": &InputValue{Value: cty.BoolVal(true), SourceType: ValueFromCLIArg},
+			},
+			expectLoadModuleCalls: []*configs.ModuleRequest{{
+				SourceAddr: mustModuleSource(t, "./modules/local"),
+			}},
+		},
+
+		"conditional version with mixed sources - version on registry": {
+			module: map[string]string{
+				"main.tf": `
+variable "use_local" {
+  type  = bool
+  const = true
+}
+
+locals {
+  source = var.use_local ? "./modules/local" : "terraform-aws-modules/vpc/aws"
+}
+
+module "example" {
+  source  = local.source
+  version = var.use_local ? null : "5.0.0"
+}
+`,
+			},
+			vars: InputValues{
+				"use_local": &InputValue{Value: cty.BoolVal(false), SourceType: ValueFromCLIArg},
+			},
+			expectLoadModuleCalls: []*configs.ModuleRequest{{
+				SourceAddr:        mustModuleSource(t, "terraform-aws-modules/vpc/aws"),
+				VersionConstraint: mustVersionContraint(t, "5.0.0"),
+			}},
+		},
+
+		"version from const variable set to null": {
+			module: map[string]string{
+				"main.tf": `
+variable "ver" {
+  type    = string
+  const   = true
+  default = null
+}
+module "local" {
+  source  = "./modules/local"
+  version = var.ver
+}
+`,
+			},
+			expectLoadModuleCalls: []*configs.ModuleRequest{{
+				SourceAddr: mustModuleSource(t, "./modules/local"),
 			}},
 		},
 	} {
@@ -746,27 +852,37 @@ module "example" {
 				t.Fatalf("expected %d LoadModule calls, got %d", len(tc.expectLoadModuleCalls), len(moduleWalker.Calls))
 			}
 
-			// Create a map of expected sources for easier comparison
-			expectedSources := make(map[string]bool)
+			// Create a map of expected sources and version constraints for comparison
+			type expectedCall struct {
+				found             bool
+				versionConstraint string
+			}
+			expectedSources := make(map[string]*expectedCall)
 			foundSources := []string{}
 			for _, expected := range tc.expectLoadModuleCalls {
-				expectedSources[expected.SourceAddr.String()] = false
+				expectedSources[expected.SourceAddr.String()] = &expectedCall{
+					versionConstraint: expected.VersionConstraint.Required.String(),
+				}
 			}
 
-			// Mark sources as found
+			// Mark sources as found and check version constraints
 			for _, call := range moduleWalker.Calls {
 				source := call.SourceAddr.String()
 				foundSources = append(foundSources, source)
-				if _, exists := expectedSources[source]; !exists {
+				if ec, exists := expectedSources[source]; !exists {
 					t.Errorf("unexpected LoadModule call for source %q", source)
 				} else {
-					expectedSources[source] = true
+					ec.found = true
+					gotConstraint := call.VersionConstraint.Required.String()
+					if gotConstraint != ec.versionConstraint {
+						t.Errorf("LoadModule call for source %q: expected version constraint %q, got %q", source, ec.versionConstraint, gotConstraint)
+					}
 				}
 			}
 
 			// Check all expected sources were called
-			for source, found := range expectedSources {
-				if !found {
+			for source, ec := range expectedSources {
+				if !ec.found {
 					t.Errorf("expected LoadModule call for source %q but it was not called. Calls that were made: \n %s", source, strings.Join(foundSources, ", "))
 				}
 			}
