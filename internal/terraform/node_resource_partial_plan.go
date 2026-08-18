@@ -211,7 +211,6 @@ ImportValidationUnknown:
 		checkState.ReportCheckableObjects(n.NodeAbstractResource.Addr, checkables)
 	}
 
-	addRootNodeToGraph(&g)
 	return &g, diags
 }
 
@@ -352,12 +351,6 @@ func (n *nodeExpandPlannableResource) knownModuleSubgraph(ctx EvalContext, addr 
 
 		// Targeting
 		&TargetsTransformer{Targets: n.Targets},
-
-		// Connect references so ordering is correct
-		&ReferenceTransformer{},
-
-		// Make sure there is a single root
-		&RootTransformer{},
 	}
 
 	b := &BasicGraphBuilder{

@@ -42,7 +42,7 @@ func (n *graphNodeImportState) Provider() ProviderRef {
 	// to populate this, possibly by calling DefaultProviderConfig() on the
 	// resource address to infer an implied provider from the resource type
 	// name.
-	return ProviderRef{addr: n.ProviderAddr}
+	return ProviderRef{Addr: n.ProviderAddr}
 }
 
 // GraphNodeProviderConsumer
@@ -203,8 +203,6 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.D
 			ResolvedProvider: n.ResolvedProvider,
 		})
 	}
-
-	addRootNodeToGraph(g)
 
 	// Done!
 	return g, diags

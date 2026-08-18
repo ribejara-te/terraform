@@ -10,6 +10,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/policy/callback"
 	"github.com/hashicorp/terraform/internal/policy/proto"
 )
@@ -66,6 +67,34 @@ type (
 
 		// CallbackService is the callback service to use for policy evaluation.
 		CallbackService uint32
+
+		// Entitlement, when non-nil, carries the host/token/org the plugin uses
+		// to verify the calling org is entitled to policy enforcement. Nil means
+		// the plugin skips the check.
+		Entitlement *Entitlement
+	}
+
+	// Entitlement is the credential triple the plugin needs to call the
+	// TFC/TFE entitlement-set endpoint during Setup.
+	Entitlement struct {
+		Host  string
+		Token string
+		Org   string
+	}
+
+	// EntitlementProvider is implemented by backends that can supply a policy
+	// entitlement from their configured credentials.
+	EntitlementProvider interface {
+		PolicyEntitlement() *Entitlement
+	}
+
+	PolicyValue struct {
+		// Raw contains the Terraform value being sent to the policy engine.
+		Raw cty.Value
+
+		// RedactedPaths contains attribute paths that should be redacted when
+		// displaying values from Raw.
+		RedactedPaths []cty.Path
 	}
 
 	EvaluationRequest[T any] struct {
@@ -73,10 +102,10 @@ type (
 		Target string
 
 		// Attrs contains the attributes of the object being evaluated.
-		Attrs cty.Value
+		Attrs PolicyValue
 
 		// PriorAttrs contains the state of the object prior to the current operation.
-		PriorAttrs cty.Value
+		PriorAttrs PolicyValue
 
 		// Meta is additional metadata required for evaluation.
 		Meta T
@@ -126,6 +155,16 @@ type (
 
 		// A combination of Policy- and Enforcement-level diagnostics.
 		Diagnostics Diagnostics
+
+		// Identity is a structured map of the identity attributes for the resource that
+		// was evaluated. It is only populated for query (list block) resources and is used
+		// by downstream consumers to correlate results to rows in the UI.
+		Identity map[string]string
+
+		// ListBlockAddr is the string address of the list block that originated this
+		// evaluation. It is only populated for query (list block) resources and is used
+		// to group results by their originating list block.
+		ListBlockAddr string
 	}
 )
 
@@ -192,9 +231,39 @@ func (r EvaluationResponse) Empty() bool {
 	return false
 }
 
+// WithLocalRange returns a copy of the response with the local range set to the given value.
+// This value typically comes from the range of the terraform object being evaluated.
+func (r EvaluationResponse) WithLocalRange(localRange *hcl.Range) EvaluationResponse {
+	r.Diagnostics = r.Diagnostics.WithLocalRange(localRange)
+	for idx := range r.Enforcements {
+		r.Enforcements[idx].LocalRange = localRange
+	}
+	return r
+}
+
+// WithQueryMetadata returns a copy of the response annotated with the identity map and list
+// block address. These fields are used by downstream consumers (UI, cloud backend) to correlate
+// policy results to the specific query row that produced them.
+func (r EvaluationResponse) WithQueryMetadata(identity map[string]string, listBlockAddr string) EvaluationResponse {
+	r.Identity = identity
+	r.ListBlockAddr = listBlockAddr
+	return r
+}
+
 func ErrorEvalFromDiags(diags []*proto.Diagnostic) EvaluationResponse {
 	return EvaluationResponse{
 		Overall:     PolicyErrorResult,
 		Diagnostics: DiagsFromProto(diags, nil),
+	}
+}
+
+// CtyToPolicyValue converts a cty.Value to a PolicyValue, unmarking the value and
+// extracting sensitive paths.
+func CtyToPolicyValue(raw cty.Value) PolicyValue {
+	raw, pvms := raw.UnmarkDeepWithPaths()
+	redactedPaths, _ := marks.PathsWithMark(pvms, marks.Sensitive)
+	return PolicyValue{
+		Raw:           raw,
+		RedactedPaths: redactedPaths,
 	}
 }

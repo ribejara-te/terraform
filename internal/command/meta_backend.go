@@ -19,11 +19,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/cli"
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/zclconf/go-cty/cty"
 
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	backendInit "github.com/hashicorp/terraform/internal/backend/init"
@@ -1386,23 +1388,27 @@ func (m *Meta) determineStateStoreInitReason(cfgState *workdir.StateStoreConfigS
 		}, diags
 	}
 
-	pLock := pLocks.Provider(cfg.ProviderAddr)
-	lockVersion, err := providerreqs.GoVersionFromVersion(pLock.Version())
-	if err != nil {
-		diags = diags.Append(tfdiags.Sourceless(
-			tfdiags.Warning,
-			"Unable to determine version of the state store provider",
-			fmt.Sprintf("Failed to parse version of %s from the lock file: %s", cfg.ProviderAddr.ForDisplay(), err),
-		))
-		return nil, diags
-	}
-	if !lockVersion.Equal(cfgState.Provider.Version) {
-		return &ssInitReason{
-			Reason: fmt.Sprintf("State store provider %q (%s) version changed from %s to %s",
-				cfg.Provider.Name, cfg.ProviderAddr.ForDisplay(),
-				cfgState.Provider.Version, lockVersion),
-			MigrationNeeded: true,
-		}, diags
+	// There will be no lock, and therefore no version data, if the provider is not managed by Terraform.
+	// As we compare supply modes above, this check can be conditional on the provider being managed.
+	if cfg.ProviderSupplyMode == getproviders.ManagedByTerraform {
+		pLock := pLocks.Provider(cfg.ProviderAddr)
+		lockVersion, err := providerreqs.GoVersionFromVersion(pLock.Version())
+		if err != nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Warning,
+				"Unable to determine version of the state store provider",
+				fmt.Sprintf("Failed to parse version of %s from the lock file: %s", cfg.ProviderAddr.ForDisplay(), err),
+			))
+			return nil, diags
+		}
+		if !lockVersion.Equal(cfgState.Provider.Version) {
+			return &ssInitReason{
+				Reason: fmt.Sprintf("State store provider %q (%s) version changed from %s to %s",
+					cfg.Provider.Name, cfg.ProviderAddr.ForDisplay(),
+					cfgState.Provider.Version, lockVersion),
+				MigrationNeeded: true,
+			}, diags
+		}
 	}
 
 	if cfgState.Type != cfg.Type {
@@ -2357,15 +2363,19 @@ func (m *Meta) stateStoreConfigNeedsMigration(cfg *configs.StateStore, cfgState 
 		return true
 	}
 
-	pLock := opts.Locks.Provider(cfg.ProviderAddr)
-	pVersion, err := providerreqs.GoVersionFromVersion(pLock.Version())
-	if err != nil {
-		log.Printf("[TRACE] stateStoreConfigNeedsMigration: unable to determine provider version (%s), so migration is required", err)
-		return true // let the migration codepath deal with the error
-	}
-	if !pVersion.Equal(cfgState.Provider.Version) {
-		log.Printf("[TRACE] stateStoreConfigNeedsMigration: provider version changed from %q to %q, so migration is required", cfgState.Provider.Version, pVersion)
-		return true
+	// There will be no lock, and therefore no version data, if the provider is not managed by Terraform.
+	// As we compare supply modes above, this check can be conditional on the provider being managed.
+	if cfg.ProviderSupplyMode == getproviders.ManagedByTerraform {
+		pLock := opts.Locks.Provider(cfg.ProviderAddr)
+		pVersion, err := providerreqs.GoVersionFromVersion(pLock.Version())
+		if err != nil {
+			log.Printf("[TRACE] stateStoreConfigNeedsMigration: unable to determine provider version (%s), so migration is required", err)
+			return true // let the migration codepath deal with the error
+		}
+		if !pVersion.Equal(cfgState.Provider.Version) {
+			log.Printf("[TRACE] stateStoreConfigNeedsMigration: provider version changed from %q to %q, so migration is required", cfgState.Provider.Version, pVersion)
+			return true
+		}
 	}
 
 	if cfg.Type != cfgState.Type {
@@ -3046,6 +3056,193 @@ func (m *Meta) StateStoreProviderFactoryFromConfigState(cfgState *workdir.StateS
 	}
 
 	return factory, diags
+}
+
+// ProviderTrust describes whether Terraform trusts a provider to use for pluggable state storage.
+// Depending on where and how the provider is fetched trust may already be established (e.g. download controlled by lock file,
+// or download from filesystem mirror) but in other situations Terraform may need to ask a user to interactively confirm trust
+// in a provider before it's used.
+// In automation interactive confirmation is not possible. Instead we enable trust to be established before download by the
+// user supplying additional dependency lock files via CLI flags.
+type ProviderTrust rune
+
+const (
+	Invalid          ProviderTrust = 0 // Something's gone so wrong there's no provider to trust or mistrust.
+	Trusted          ProviderTrust = 'P'
+	RequiresApproval ProviderTrust = 'A' // Not _yet_ trusted, may be accepted or rejected later.
+)
+
+// determineIfProviderTrusted returns a `ProviderTrust` rune that informs calling code whether a given provider is considered to have
+// trust already established (i.e. downloaded for the first time from a trusted source, or download controlled by a dep lock file).
+// If trust isn't established, the calling code is responsible to prompt the user to establish trust or to raise an error.
+//
+// The `providerLocations` map parameter is expected to be created by the `FetchPackageBegin` callback, which is called during provider download.
+func (m *Meta) determineIfProviderTrusted(provider addrs.Provider, providerLocations map[addrs.Provider]getproviders.PackageLocation, previousLocks *depsfile.Locks) ProviderTrust {
+	location, ok := providerLocations[provider]
+	if !ok || previousLocks.AllProviders()[provider] != nil {
+		// Either:
+		//  - the provider was already downloaded to the cache (ok == false, due to FetchPackageBegin callback not being invoked)
+		// or:
+		//  - the provider isn't already downloaded to the cache BUT installation is controlled by a lock file.
+		//
+		// In both cases trust is already established; skip requesting approval.
+		log.Printf("[TRACE] init (determineIfProviderTrusted): the state storage provider %s (%q) was present in a dependency lock file during provider installation, so we consider it safe", provider.Type, provider)
+		return Trusted
+	} else {
+		// The provider wasn't in the dependency lock file so it's being download for the first time
+		// (we block upgrading the state store provider in this method).
+		log.Printf("[TRACE] init (determineIfProviderTrusted): the state storage provider %s (%q) will be changed in the dependency lock file during provider installation.", provider.Type, provider)
+		switch location.(type) {
+		case getproviders.PackageLocalArchive, getproviders.PackageLocalDir:
+			// If the provider is downloaded from a local source we assume it's safe.
+			// We don't require presence of the -safe-init flag, or require input from the user to approve its usage.
+			log.Printf("[TRACE] init (determineIfProviderTrusted): the state storage provider %s (%q) is downloaded from a local source, so we consider it safe.", provider.Type, provider)
+			return Trusted
+		case getproviders.PackageHTTPURL:
+			log.Printf("[DEBUG] init (determineIfProviderTrusted): the state storage provider %s (%q) is downloaded via HTTP, so we consider it potentially unsafe.", provider.Type, provider)
+			return RequiresApproval
+		default:
+			panic(fmt.Sprintf("init (determineIfProviderTrusted): unexpected provider location type for state storage provider %q: %T", provider, location))
+		}
+	}
+}
+
+// confirmProviderIsTrusted takes the action determined by `determineIfProviderTrusted` and either prompts the user for approval, or returns an error if something has gone wrong with pre-supplied locks when Terraform was run in automation.
+//
+// NOTE: the command parameter is used to determine which command is being run, so that we can provide more specific guidance to the user. Do not use that parameter for any other purpose!
+func (m *Meta) confirmProviderIsTrusted(trust ProviderTrust, provider addrs.Provider, stateStoreProviderAuthResult *getproviders.PackageAuthenticationResult, stateStoreProviderLock, locksBeforeInstall *depsfile.Locks, flagLockfilePath string, command cli.Command, view views.StateStoreProviderTrustLogger) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	switch trust {
+	case Trusted:
+		// do nothing; provider is already trusted and there's no need to notify the user.
+
+		if flagLockfilePath != "" {
+			// If the user supplied a lock file path via CLI flag, we should notify them that it was used.
+			view.LogAutomaticApproval()
+			view.Spacer()
+		}
+	case RequiresApproval:
+		if m.input {
+			// Prompt the user about trusting the provider used for state storage.
+			diags = diags.Append(m.promptStateStorageProviderApproval(provider, stateStoreProviderLock, stateStoreProviderAuthResult))
+			if diags.HasErrors() {
+				view.LogInteractiveRejection()
+				view.Spacer()
+				return diags
+			}
+
+			view.LogInteractiveApproval()
+			view.Spacer()
+		} else {
+			// Confirm that a lock was used to control download.
+			// Note: we have to wait and do that here because at this point we know the provider was downloaded from a source that requires additional info about trust.
+			if locksBeforeInstall.Provider(provider) == nil {
+				// No lock was provided for the state store provider either through pre-existing locks or through CLI flags.
+
+				var lockfileProblem string
+				switch {
+				case flagLockfilePath != "":
+					// CLI-supplied file
+					lockfileProblem = fmt.Sprintf("The lock file at %q (supplied via CLI flag) was empty or did not contain a lock for the state store provider.", flagLockfilePath)
+				case locksBeforeInstall.Empty():
+					// Default lock file used, but it was empty.
+					lockfileProblem = "Terraform used the working directory's lock file by default, but it was empty or did not exist."
+				default:
+					// Default lock file used, and it exists/has locks in it.
+					lockfileProblem = "Terraform used the working directory's lock file by default, but it did not contain a lock for the state store provider."
+				}
+
+				var guidance string
+				var remediationInstructions string
+				switch command.(type) {
+				case *InitCommand:
+					guidance = `When performing a "terraform init" command in automation, make sure to supply a lock file for the state store provider using the -state-provider-lock-file flag.`
+					remediationInstructions = `To fix this, create a minimal configuration containing the specific provider version(s) you need and then perform "terraform init" with input enabled. Check the contents of the lock file created by that command and then retry "terraform init -state-provider-lock-file=<path to lockfile>".
+`
+				case *StateMigrateCommand:
+					guidance = `When performing a "terraform state migrate" command in automation, make sure to supply a lock file for the source and/or destination state store providers using -source-provider-lock-file and/or -destination-provider-lock-file flags.`
+					remediationInstructions = `To fix this, create a minimal configuration(s) containing the specific provider version(s) you need and then perform "terraform init" with input enabled. Check the contents of the lock file created by that command and then retry "terraform state migrate -source-provider-lock-file=<path to lockfile> -destination-provider-lock-file=<path to lockfile>".`
+
+				default:
+					panic("Unexpected command type in confirmProviderIsTrusted; this is a bug in Terraform and should be reported.")
+				}
+
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Missing lock for state store provider",
+					fmt.Sprintf(`Terraform is initializing a state store for the first time in a non-interactive mode but no lock was found for the state store provider.
+%s
+
+%s
+
+%s`,
+						lockfileProblem,
+						guidance,
+						remediationInstructions,
+					),
+				))
+				return diags
+			}
+		}
+	default:
+		// Handle Invalid or unexpected action types
+		panic(fmt.Sprintf("When installing providers described in the config Terraform couldn't determine what 'safe init' action should be taken and returned action type %T. This is a bug in Terraform and should be reported.", trust))
+	}
+
+	return diags
+}
+
+// promptStateStorageProviderApproval is used when Terraform is unsure about the safety of the provider downloaded for state storage
+// purposes, and we need to prompt the user to approve or reject using it.
+func (m *Meta) promptStateStorageProviderApproval(stateStorageProvider addrs.Provider, locksAfterInstall *depsfile.Locks, authResult *getproviders.PackageAuthenticationResult) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	// If we can receive input then we prompt for ok from the user
+	lock := locksAfterInstall.Provider(stateStorageProvider)
+
+	var hashList strings.Builder
+	for _, hash := range lock.PreferredHashes() {
+		hashList.WriteString(fmt.Sprintf("- %s\n", hash))
+	}
+
+	var authentication string
+	if authResult != nil && authResult.KeyID != "" {
+		authentication = fmt.Sprintf("%s, key ID %s", authResult.String(), authResult.KeyID)
+	} else {
+		authentication = authResult.String()
+	}
+
+	v, err := m.UIInput().Input(context.Background(), &terraform.InputOpts{
+		Id: fmt.Sprintf("approve-provider-%s-%s", lock.Provider().Type, lock.Version()), // E.g. approve-provider-aws-4.0.0. This needs to be unique in case the command needs approval for >1 provider.
+		Query: fmt.Sprintf(`Do you want to use provider %q (%s), version %s, for managing state?
+Platform: %s
+Authentication: %s
+Hashes:
+%s
+`,
+			lock.Provider().Type,
+			lock.Provider(),
+			lock.Version(),
+			getproviders.CurrentPlatform.String(),
+			authentication,
+			hashList.String(),
+		),
+		Description: fmt.Sprintf(`Check the details above for provider %q and confirm that you trust the provider.
+	Only 'yes' will be accepted to confirm.`, lock.Provider().Type),
+	})
+	if err != nil {
+		return diags.Append(fmt.Errorf("Failed to approve use of state storage provider: %s", err))
+	}
+	if v != "yes" {
+		return diags.Append(
+			fmt.Errorf("State store provider %q (%s) was not approved, so init cannot continue.",
+				lock.Provider().Type,
+				lock.Provider(),
+			),
+		)
+	}
+	return diags
 }
 
 //-------------------------------------------------------------------

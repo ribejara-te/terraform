@@ -11,7 +11,6 @@ import (
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
 
-	"github.com/hashicorp/terraform/internal/actions"
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -61,11 +60,6 @@ type MockEvalContext struct {
 	ProviderSchemaAddr   addrs.AbsProviderConfig
 	ProviderSchemaSchema providers.ProviderSchema
 	ProviderSchemaError  error
-
-	ResourceIdentitySchemasCalled  bool
-	ResourceIdentitySchemasAddr    addrs.AbsProviderConfig
-	ResourceIdentitySchemasSchemas providers.ResourceIdentitySchemas
-	ResourceIdentitySchemasError   error
 
 	CloseProviderCalled   bool
 	CloseProviderAddr     addrs.AbsProviderConfig
@@ -174,15 +168,12 @@ type MockEvalContext struct {
 	ForgetCalled bool
 	ForgetValues bool
 
-	ActionsCalled bool
-	ActionsState  *actions.Actions
-
-	ProviderLocksValue map[addrs.Provider]*depsfile.ProviderLock
-	PolicyClientValue  policy.Client
-	PolicyResultsValue *plans.PolicyResults
-	ConfigValue        *configs.Config
-	DeprecationCalled  bool
-	DeprecationState   *deprecation.Deprecations
+	ProviderLocksValue   map[addrs.Provider]*depsfile.ProviderLock
+	PolicyClientValue    policy.Client
+	PolicySemaphoreValue Semaphore
+	ConfigValue          *configs.Config
+	DeprecationCalled    bool
+	DeprecationState     *deprecation.Deprecations
 }
 
 // MockEvalContext implements EvalContext
@@ -229,12 +220,6 @@ func (c *MockEvalContext) ProviderSchema(addr addrs.AbsProviderConfig) (provider
 	c.ProviderSchemaCalled = true
 	c.ProviderSchemaAddr = addr
 	return c.ProviderSchemaSchema, c.ProviderSchemaError
-}
-
-func (c *MockEvalContext) ResourceIdentitySchemas(addr addrs.AbsProviderConfig) (providers.ResourceIdentitySchemas, error) {
-	c.ResourceIdentitySchemasCalled = true
-	c.ResourceIdentitySchemasAddr = addr
-	return c.ResourceIdentitySchemasSchemas, c.ProviderSchemaError
 }
 
 func (c *MockEvalContext) CloseProvider(addr addrs.AbsProviderConfig) error {
@@ -467,11 +452,6 @@ func (ctx *MockEvalContext) ClientCapabilities() providers.ClientCapabilities {
 	}
 }
 
-func (c *MockEvalContext) Actions() *actions.Actions {
-	c.ActionsCalled = true
-	return c.ActionsState
-}
-
 func (c *MockEvalContext) ProviderLocks() map[addrs.Provider]*depsfile.ProviderLock {
 	return c.ProviderLocksValue
 }
@@ -480,12 +460,12 @@ func (c *MockEvalContext) PolicyClient() policy.Client {
 	return c.PolicyClientValue
 }
 
-func (c *MockEvalContext) Config() *configs.Config {
-	return c.ConfigValue
+func (c *MockEvalContext) PolicySemaphore() Semaphore {
+	return c.PolicySemaphoreValue
 }
 
-func (c *MockEvalContext) PolicyResults() *plans.PolicyResults {
-	return c.PolicyResultsValue
+func (c *MockEvalContext) Config() *configs.Config {
+	return c.ConfigValue
 }
 
 func (c *MockEvalContext) Deprecations() *deprecation.Deprecations {

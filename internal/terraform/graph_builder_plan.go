@@ -5,6 +5,7 @@ package terraform
 
 import (
 	"log"
+	"slices"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -77,13 +78,10 @@ type PlanGraphBuilder struct {
 
 	ConcreteProvider                ConcreteProviderNodeFunc
 	ConcreteResource                ConcreteResourceNodeFunc
-	ConcreteResourceInstance        ConcreteResourceInstanceNodeFunc
+	ConcreteDestroyResourceInstance ConcreteResourceInstanceNodeFunc
 	ConcreteResourceOrphan          ConcreteResourceInstanceNodeFunc
 	ConcreteResourceInstanceDeposed ConcreteResourceInstanceDeposedNodeFunc
 	ConcreteModule                  ConcreteModuleNodeFunc
-	// ConcreteAction is only used by the ConfigTransformer during the Validate
-	// Graph walk; otherwise we fall back to the DefaultConcreteActionFunc.
-	ConcreteAction ConcreteActionNodeFunc
 
 	// Plan Operation this graph will be used for.
 	Operation walkOperation
@@ -165,34 +163,13 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 	steps := []GraphTransformer{
 		// Creates all the resources represented in the config
 		&ConfigTransformer{
-			Concrete:       b.ConcreteResource,
-			ConcreteAction: b.ConcreteAction,
-			Config:         b.Config,
-			destroy:        b.Operation == walkDestroy || b.Operation == walkPlanDestroy,
+			Concrete:  b.ConcreteResource,
+			Config:    b.Config,
+			Operation: b.Operation,
 
 			importTargets: b.ImportTargets,
 
 			generateConfigPathForImportTargets: b.GenerateConfigPath,
-		},
-
-		&ActionTriggerConfigTransformer{
-			Config:        b.Config,
-			Operation:     b.Operation,
-			ActionTargets: b.ActionTargets,
-			queryPlanMode: b.queryPlan,
-
-			ConcreteActionTriggerNodeFunc: func(node *nodeAbstractActionTrigger, _ RelativeActionTiming) dag.Vertex {
-				return &nodeActionTriggerPlanExpand{
-					nodeAbstractActionTrigger: node,
-				}
-			},
-		},
-
-		&ActionInvokePlanTransformer{
-			Config:        b.Config,
-			Operation:     b.Operation,
-			ActionTargets: b.ActionTargets,
-			queryPlanMode: b.queryPlan,
 		},
 
 		// Add dynamic values
@@ -247,7 +224,7 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		// ConfigTransformer created nodes that will do that during
 		// DynamicExpand.)
 		&StateTransformer{
-			ConcreteCurrent: b.ConcreteResourceInstance,
+			ConcreteCurrent: b.ConcreteDestroyResourceInstance,
 			ConcreteDeposed: b.ConcreteResourceInstanceDeposed,
 			State:           b.State,
 		},
@@ -274,6 +251,17 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		// Must attach schemas before ReferenceTransformer so that we can
 		// analyze the configuration to find references.
 		&AttachSchemaTransformer{Plugins: b.Plugins, Config: b.Config},
+
+		// In order to analyze any use of caller, this must happen after
+		// AttachSchemaTransformer so we can get all references from the action
+		// configs.
+		&ActionInvokePlanTransformer{
+			Config:          b.Config,
+			Operation:       b.Operation,
+			ActionTargets:   b.ActionTargets,
+			ResourceTargets: b.Targets,
+			queryPlanMode:   b.queryPlan,
+		},
 
 		// Create expansion nodes for all of the module calls. This must
 		// come after all other transformers that create nodes representing
@@ -304,7 +292,7 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		},
 
 		// Target
-		&TargetsTransformer{Targets: b.Targets},
+		&TargetsTransformer{Targets: slices.Concat(b.Targets, b.ActionTargets)},
 
 		// Filter the graph to only include nodes that are relevant to the query operation.
 		&QueryTransformer{queryPlan: b.queryPlan, validate: b.Operation == walkValidate},
@@ -320,15 +308,7 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		&CloseProviderTransformer{},
 
 		// Request policy evaluation for resources.
-		&policyEvalTransformer{
-			PolicyClient: func() policy.Client {
-				// Skip policy evaluation during predestroy refresh.
-				if b.preDestroyRefresh {
-					return nil
-				}
-				return b.PolicyClient
-			}(),
-		},
+		&policyEvalTransformer{PolicyClient: b.PolicyClient, QueryPlan: b.queryPlan},
 
 		// Close the root module
 		&CloseRootModuleTransformer{},
@@ -387,7 +367,7 @@ func (b *PlanGraphBuilder) initPlan() {
 func (b *PlanGraphBuilder) initDestroy() {
 	b.initPlan()
 
-	b.ConcreteResourceInstance = func(a *NodeAbstractResourceInstance) dag.Vertex {
+	b.ConcreteDestroyResourceInstance = func(a *NodeAbstractResourceInstance) dag.Vertex {
 		a.overridePreventDestroy = b.overridePreventDestroy
 		return &NodePlanDestroyableResourceInstance{
 			NodeAbstractResourceInstance: a,
@@ -413,12 +393,6 @@ func (b *PlanGraphBuilder) initValidate() {
 	b.ConcreteModule = func(n *nodeExpandModule) dag.Vertex {
 		return &nodeValidateModule{
 			nodeExpandModule: *n,
-		}
-	}
-
-	b.ConcreteAction = func(a *NodeAbstractAction) dag.Vertex {
-		return &NodeValidatableAction{
-			NodeAbstractAction: a,
 		}
 	}
 }

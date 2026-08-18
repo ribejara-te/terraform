@@ -5,6 +5,8 @@ package terraform
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
@@ -14,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/getmodules/moduleaddrs"
 	"github.com/hashicorp/terraform/internal/lang/langrefs"
+	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -107,14 +110,14 @@ func (n *nodeInstallModule) Execute(ctx EvalContext, walkOp walkOperation) tfdia
 		CallRange:         n.ModuleCall.DeclRange,
 	}
 
-	cfg, v, modDiags := n.Walker.LoadModule(req)
+	modCfg, v, modDiags := n.Walker.LoadModule(req)
 	diags = diags.Append(modDiags)
 	if diags.HasErrors() {
 		return diags
 	}
 
 	config := &configs.Config{
-		Module:            cfg,
+		Module:            modCfg,
 		Parent:            n.Parent,
 		Path:              n.Addr.Module(),
 		Root:              n.Parent.Root,
@@ -126,6 +129,8 @@ func (n *nodeInstallModule) Execute(ctx EvalContext, walkOp walkOperation) tfdia
 		Version:           v,
 		VersionConstraint: version,
 	}
+
+	diags = diags.Append(n.validateModuleConfig(modCfg, config.Path))
 
 	// Insert the installed module into the children of the current module
 	currentModuleKey := n.Addr[len(n.Addr)-1].Name
@@ -140,7 +145,40 @@ func (n *nodeInstallModule) Execute(ctx EvalContext, walkOp walkOperation) tfdia
 	n.Config = config
 	n.Version = v
 
-	return nil
+	return diags
+}
+
+func (n *nodeInstallModule) validateModuleConfig(mod *configs.Module, modPath addrs.Module) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	if mod.Backend != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagWarning,
+			Summary:  "Backend configuration ignored",
+			Detail:   "Any selected backend applies to the entire configuration, so Terraform expects backend configurations only in the root module.\n\nThis is a warning rather than an error because it's sometimes convenient to temporarily call a root module as a child module for testing purposes, but this backend configuration block will have no effect.",
+			Subject:  mod.Backend.DeclRange.Ptr(),
+		})
+	}
+
+	if mod.CloudConfig != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagWarning,
+			Summary:  "Cloud configuration ignored",
+			Detail:   "A cloud configuration block applies to the entire configuration, so Terraform expects 'cloud' blocks to only be in the root module.\n\nThis is a warning rather than an error because it's sometimes convenient to temporarily call a root module as a child module for testing purposes, but this cloud configuration block will have no effect.",
+			Subject:  mod.CloudConfig.DeclRange.Ptr(),
+		})
+	}
+
+	if len(mod.ListResources) > 0 {
+		first := slices.Collect(maps.Values(mod.ListResources))[0]
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid list configuration",
+			Detail:   fmt.Sprintf("A list block was detected in %q. List blocks are only allowed in the root module.", modPath),
+			Subject:  first.DeclRange.Ptr(),
+		})
+	}
+
+	return diags
 }
 
 func (n *nodeInstallModule) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagnostics) {
@@ -166,8 +204,6 @@ func (n *nodeInstallModule) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diag
 		return nil, diags
 	}
 	g.Subsume(&graph.AcyclicGraph.Graph)
-
-	addRootNodeToGraph(&g)
 
 	return &g, nil
 }
@@ -204,6 +240,16 @@ func evalSource(sourceExpr hcl.Expression, hasVersion bool, ctx EvalContext) (ad
 		return nil, "", diags
 	}
 
+	if value.IsNull() {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Unsuitable module source",
+			Detail:   `Unsuitable value: null value is not allowed.`,
+			Subject:  sourceExpr.Range().Ptr(),
+		})
+		return nil, "", diags
+	}
+
 	if !value.IsWhollyKnown() {
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity: hcl.DiagError,
@@ -213,6 +259,20 @@ func evalSource(sourceExpr hcl.Expression, hasVersion bool, ctx EvalContext) (ad
 		})
 		return nil, "", diags
 	}
+
+	if marks.Has(value, marks.Sensitive) || marks.Has(value, marks.Ephemeral) {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Unknown module source",
+			Detail:   "The module source cannot be derived from a sensitive or ephemeral value.",
+			Subject:  sourceExpr.Range().Ptr(),
+		})
+		return nil, "", diags
+	}
+
+	// Strip any remaining marks (such as deprecation marks, which are allowed)
+	// so that AsString cannot panic.
+	value, _ = value.Unmark()
 
 	rawSource := value.AsString()
 	if hasVersion {
@@ -320,6 +380,20 @@ func evalVersionConstraint(versionExpr hcl.Expression, ctx EvalContext) (configs
 		})
 		return ret, diags
 	}
+
+	if marks.Has(value, marks.Sensitive) || marks.Has(value, marks.Ephemeral) {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Unknown module version",
+			Detail:   "The module version cannot be derived from a sensitive or ephemeral value.",
+			Subject:  versionExpr.Range().Ptr(),
+		})
+		return ret, diags
+	}
+
+	// Strip any remaining marks (such as deprecation marks, which are allowed)
+	// so that AsString cannot panic.
+	value, _ = value.Unmark()
 
 	constraintStr := value.AsString()
 	constraints, err := version.NewConstraint(constraintStr)

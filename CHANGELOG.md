@@ -1,34 +1,21 @@
-## 1.16.0 (Unreleased)
-
-
-NEW FEATURES:
-
-* Store PlannedPrivate data for providers ([#37986](https://github.com/hashicorp/terraform/issues/37986))
-
-* New store block in terraform_data that can handle ephemeral and sensitive values ([#38298](https://github.com/hashicorp/terraform/issues/38298))
-
-* Providers can now use nested blocks as computed values ([#38305](https://github.com/hashicorp/terraform/issues/38305))
-
-* We now produce builds for Linux s390x (zLinux) ([#38384](https://github.com/hashicorp/terraform/issues/38384))
-
-* workspace: The `workspace list` command can now produce machine-readable output when supplied with the `-json` flag ([#38397](https://github.com/hashicorp/terraform/issues/38397))
+## 1.17.0 (Unreleased)
 
 
 ENHANCEMENTS:
 
-* feat(cli): terraform state show accepts a -json flag ([#23940](https://github.com/hashicorp/terraform/issues/23940))
-
-* Show info when resources are left behind due to skip_cleanup ([#38449](https://github.com/hashicorp/terraform/issues/38449))
+* command/init: Enrich log messages with provider versions ([#38918](https://github.com/hashicorp/terraform/issues/38918))
 
 
 BUG FIXES:
 
-* import blocks no longer ignore provider local names ([#38338](https://github.com/hashicorp/terraform/issues/38338))
+* funcs: pow and log no longer panic when result is not a number ([#38912](https://github.com/hashicorp/terraform/issues/38912))
+
+* ephemeral: Terraform will now use and display diagnostics raised when _renewing_ an ephemeral resource. This may cause warnings to appear that previously were lost. We expect that any error diagnostics that were previously lost would have caused confusing downstream errors, so we do not anticipate this change to be breaking. ([#38989](https://github.com/hashicorp/terraform/issues/38989))
 
 
-UPGRADE NOTES:
+NOTES:
 
-* Provisioner bastion_host_key is now correctly applied. Existing usage of bastion_host_key should verify the configured key is correct. ([#38318](https://github.com/hashicorp/terraform/issues/38318))
+* version: JSON output now includes a new `format_version` field, which will enable safer future changes of the command's JSON output format. It is assumed existing tooling ignores unknown fields and therefore this change should not be breaking in itself but we advice consumers to pay attention to `format_version` in future releases and/or use latest version of hashicorp/terraform-json & hashicorp/terraform-exec which does. ([#38930](https://github.com/hashicorp/terraform/issues/38930))
 
 
 EXPERIMENTS:
@@ -40,11 +27,13 @@ Experiments are only enabled in alpha releases of Terraform CLI. The following f
 - `terraform test`: `backend` blocks and `skip_cleanup` attributes:
   - Test authors can now specify `backend` blocks within `run` blocks in Terraform Test files. Run blocks with `backend` blocks will load state from the specified backend instead of starting from empty state on every execution. This allows test authors to keep long-running test infrastructure alive between test operations, saving time during regular test operations.
   - Test authors can now specify `skip_cleanup` attributes within test files and within run blocks. The `skip_cleanup` attribute tells `terraform test` not to clean up state files produced by run blocks with this attribute set to true. The state files for affected run blocks will be written to disk within the `.terraform` directory, where they can then be cleaned up manually using the also experimental `terraform test cleanup` command.
+- `terraform query`: The experimental `-policies` flag permits specifying one or more policy set directory paths to evaluate policies against resources discovered by list blocks during a query operation.
 
 ## Previous Releases
 
 For information on prior major and minor releases, refer to their changelogs:
 
+- [v1.16](https://github.com/hashicorp/terraform/blob/v1.16/CHANGELOG.md)
 - [v1.15](https://github.com/hashicorp/terraform/blob/v1.15/CHANGELOG.md)
 - [v1.14](https://github.com/hashicorp/terraform/blob/v1.14/CHANGELOG.md)
 - [v1.13](https://github.com/hashicorp/terraform/blob/v1.13/CHANGELOG.md)

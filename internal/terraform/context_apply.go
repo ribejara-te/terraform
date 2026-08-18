@@ -49,15 +49,14 @@ type ApplyOpts struct {
 	// the actual root modules.
 	AllowRootEphemeralOutputs bool
 
-	// Locks is a read-only snapshot of provider locks (from the dependency lock
+	// ProviderLocks is a read-only snapshot of provider locks (from the dependency lock
 	// file). This is required by policy evaluations against providers to access version information.
-	Locks map[addrs.Provider]*depsfile.ProviderLock
+	ProviderLocks map[addrs.Provider]*depsfile.ProviderLock
 
 	// Optional policy client.
 	// When set, policy evaluation logic will be executed in the graph.
 	// When nil, that logic will be skipped.
-	PolicyClient  policy.Client
-	PolicyResults *plans.PolicyResults
+	PolicyClient policy.Client
 }
 
 // ApplyOpts creates an [ApplyOpts] with copies of all of the elements that
@@ -73,7 +72,7 @@ func (po *PlanOpts) ApplyOpts() *ApplyOpts {
 	return &ApplyOpts{
 		ExternalProviders:         po.ExternalProviders,
 		AllowRootEphemeralOutputs: po.AllowRootEphemeralOutputs,
-		Locks:                     po.Locks,
+		ProviderLocks:             po.ProviderLocks,
 	}
 }
 
@@ -221,16 +220,19 @@ func (c *Context) ApplyAndEval(plan *plans.Plan, config *configs.Config, opts *A
 
 		FunctionResults: lang.NewFunctionResultsTable(plan.FunctionResults),
 
-		Locks:         opts.Locks,
+		ProviderLocks: opts.ProviderLocks,
 		PolicyClient:  opts.PolicyClient,
-		PolicyResults: opts.PolicyResults,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
 
 	// After the walk is finished, we capture a simplified snapshot of the
 	// check result data as part of the new state.
-	walker.State.RecordCheckResults(walker.Checks)
+	// The concurrent-safe state has already been closed by the walk, so we
+	// need to access the underlying state object directly to update it.
+	state := walker.State.Lock()
+	state.RecordCheckResults(walker.Checks)
+	walker.State.Unlock()
 
 	newState := walker.State.Close()
 	if plan.UIMode == plans.DestroyMode && !diags.HasErrors() {
@@ -242,7 +244,7 @@ func (c *Context) ApplyAndEval(plan *plans.Plan, config *configs.Config, opts *A
 		newState.PruneResourceHusks()
 	}
 
-	if len(plan.TargetAddrs) > 0 {
+	if len(plan.TargetAddrs) > 0 && len(plan.ActionTargetAddrs) == 0 {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Warning,
 			"Applied changes may be incomplete",

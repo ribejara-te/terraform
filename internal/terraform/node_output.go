@@ -164,7 +164,6 @@ func (n *nodeExpandOutput) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagn
 			g.Add(node)
 		},
 	)
-	addRootNodeToGraph(&g)
 
 	if checkableAddrs != nil {
 		checkState := ctx.Checks()
@@ -532,7 +531,15 @@ If you do intend to export this data, annotate the output value as sensitive by 
 		}
 	} else if n.Config.Expr != nil {
 		var deprecationDiags tfdiags.Diagnostics
-		val, deprecationDiags = ctx.Deprecations().ValidateExpressionDeepAndUnmark(val, n.ModulePath(), n.Config.Expr)
+		if n.ModulePath().IsRoot() {
+			val, deprecationDiags = ctx.Deprecations().ValidateExpressionDeepAndUnmark(val, n.ModulePath(), n.Config.Expr)
+		} else {
+			// If the output is in a child module, only check for deprecations
+			// at the "top level". This avoids deprecation warnings when
+			// outputting an entire resource with a nested deprecated attribute.
+			// (References to said attribute should still incur a warning)
+			val, deprecationDiags = ctx.Deprecations().ValidateAndUnmark(val, n.ModulePath(), n.Config.Expr.Range().Ptr())
+		}
 		diags = diags.Append(deprecationDiags)
 	}
 
@@ -619,6 +626,10 @@ type nodeOutputInPartialModule struct {
 	// Refresh-only mode means that any failing output preconditions are
 	// reported as warnings rather than errors
 	RefreshOnly bool
+}
+
+func (n *nodeOutputInPartialModule) Name() string {
+	return n.Addr.String()
 }
 
 // Path implements [GraphNodePartialExpandedModule], meaning that the

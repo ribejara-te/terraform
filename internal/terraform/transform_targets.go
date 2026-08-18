@@ -25,24 +25,17 @@ type GraphNodeTargetable interface {
 type TargetsTransformer struct {
 	// List of targeted resource names specified by the user.
 	Targets []addrs.Targetable
-
-	// List of targeted actions specified by the user.
-	ActionTargets []addrs.Targetable
 }
 
 func (t *TargetsTransformer) Transform(g *Graph) error {
-	if len(t.Targets) == 0 && len(t.ActionTargets) == 0 {
+	if len(t.Targets) == 0 {
 		return nil
 	}
 
-	// in practice, these are mutually exclusive so only one of these function
-	// calls will do any work
-
 	targetedNodes := t.selectTargetedNodes(g, t.Targets)
-	targetedActions := t.selectTargetedNodes(g, t.ActionTargets)
-	for _, v := range g.Vertices() {
-		if !targetedNodes.Include(v) && !targetedActions.Include(v) {
-			log.Printf("[DEBUG] Removing %q, filtered by targeting.", dag.VertexName(v))
+	for v := range g.VerticesSeq() {
+		if !targetedNodes.Contains(v) {
+			log.Printf("[DEBUG] Removing %q, filtered by targeting.", v.Name())
 			g.Remove(v)
 		}
 	}
@@ -53,15 +46,15 @@ func (t *TargetsTransformer) Transform(g *Graph) error {
 // Returns a set of targeted nodes. A targeted node is either addressed
 // directly, address indirectly via its container, or it's a dependency of a
 // targeted node.
-func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targetable) dag.Set {
-	targetedNodes := make(dag.Set)
+func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targetable) dag.VertexSet {
+	targetedNodes := dag.NewVertexSet()
 	if len(addrs) == 0 {
 		return targetedNodes
 	}
 
-	vertices := g.Vertices()
+	vertices := g.VerticesSeq()
 
-	for _, v := range vertices {
+	for v := range vertices {
 		if t.nodeIsTarget(v, addrs) {
 			// We need to add everything this node depends on or that is closely associated with
 			// this node. In case of resource nodes, action triggers are considered closely related
@@ -74,15 +67,6 @@ func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targeta
 			if tn, ok := v.(GraphNodeTargetable); ok {
 				tn.SetTargets(addrs)
 			}
-
-			if _, ok := v.(*nodeExpandPlannableResource); ok {
-				// We want to also set the resource instance triggers on the related action triggers
-				for _, d := range g.UpEdges(v) {
-					if actionTrigger, ok := d.(*nodeActionTriggerPlanExpand); ok {
-						actionTrigger.SetResourceTargets(addrs)
-					}
-				}
-			}
 		}
 	}
 
@@ -91,7 +75,7 @@ func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targeta
 	// side effects from the targeted nodes, these are added because outputs
 	// cannot be targeted on their own.
 	// Start by finding the root module output nodes themselves
-	for _, v := range vertices {
+	for v := range vertices {
 		// outputs are all temporary value types
 		tv, ok := v.(graphNodeTemporaryValue)
 		if !ok {
@@ -108,7 +92,7 @@ func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targeta
 		// will keep it
 		deps := g.Ancestors(v)
 		found := 0
-		for _, d := range deps {
+		for d := range deps.All() {
 			switch d.(type) {
 			case GraphNodeResourceInstance:
 			case GraphNodeConfigResource:
@@ -116,7 +100,7 @@ func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targeta
 				continue
 			}
 
-			if !targetedNodes.Include(d) {
+			if !targetedNodes.Contains(d) {
 				// this dependency isn't being targeted, so we can't process this
 				// output
 				found = 0
@@ -129,7 +113,7 @@ func (t *TargetsTransformer) selectTargetedNodes(g *Graph, addrs []addrs.Targeta
 		if found > 0 {
 			// we found an output we can keep; add it, and all it's dependencies
 			targetedNodes.Add(v)
-			for _, d := range deps {
+			for d := range deps.All() {
 				targetedNodes.Add(d)
 			}
 		}
@@ -161,9 +145,11 @@ func (t *TargetsTransformer) nodeIsTarget(v dag.Vertex, targets []addrs.Targetab
 		vertexAddr = r.ResourceInstanceAddr()
 	case GraphNodeConfigResource:
 		vertexAddr = r.ResourceAddr()
+
+	// invoke nodes are implicitly targeted
 	case *nodeActionInvokeExpand:
-		vertexAddr = r.Target
-	case *nodeActionTriggerApplyInstance:
+		vertexAddr = r.Addr
+	case *nodeActionInvokeApplyInstance:
 		vertexAddr = r.ActionInvocation.Addr
 
 	default:
@@ -203,39 +189,13 @@ func (t *TargetsTransformer) nodeIsTarget(v dag.Vertex, targets []addrs.Targetab
 // triggering node has planned so that we can ensure the actions are only planned if the triggering
 // resource has an action (Create / Update) corresponding to one of the events in the action trigger
 // blocks event list.
-func (t *TargetsTransformer) addVertexDependenciesToTargetedNodes(g *Graph, v dag.Vertex, targetedNodes dag.Set, addrs []addrs.Targetable) {
-	if targetedNodes.Include(v) {
+func (t *TargetsTransformer) addVertexDependenciesToTargetedNodes(g *Graph, v dag.Vertex, targetedNodes dag.VertexSet, addrs []addrs.Targetable) {
+	if targetedNodes.Contains(v) {
 		return
 	}
 	targetedNodes.Add(v)
 
-	for _, d := range g.Ancestors(v) {
+	for d := range g.Ancestors(v).All() {
 		t.addVertexDependenciesToTargetedNodes(g, d, targetedNodes, addrs)
-	}
-
-	if _, ok := v.(*nodeExpandPlannableResource); ok {
-		// We want to also add the action triggers related to this resource
-		for _, d := range g.UpEdges(v) {
-			if _, ok := d.(*nodeActionTriggerPlanExpand); ok {
-				t.addVertexDependenciesToTargetedNodes(g, d, targetedNodes, addrs)
-			}
-		}
-	}
-
-	// An applyable resources might have an associated after_* triggered action.
-	// We need to add that action to the targeted nodes as well, together with all its dependencies.
-	if _, ok := v.(*nodeExpandApplyableResource); ok {
-		for _, f := range g.UpEdges(v) {
-			if _, ok := f.(*nodeActionTriggerApplyExpand); ok {
-				t.addVertexDependenciesToTargetedNodes(g, f, targetedNodes, addrs)
-			}
-		}
-	}
-	if _, ok := v.(*NodeApplyableResourceInstance); ok {
-		for _, f := range g.UpEdges(v) {
-			if _, ok := f.(*nodeActionTriggerApplyExpand); ok {
-				t.addVertexDependenciesToTargetedNodes(g, f, targetedNodes, addrs)
-			}
-		}
 	}
 }

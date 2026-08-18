@@ -162,31 +162,11 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		// with dependency edges against the whole-resource nodes added by
 		// ConfigTransformer above.
 		&DiffTransformer{
-			Concrete: concreteResourceInstance,
-			State:    b.State,
-			Changes:  b.Changes,
-			Config:   b.Config,
-		},
-
-		&ActionTriggerConfigTransformer{
-			Config:        b.Config,
-			Operation:     b.Operation,
-			ActionTargets: b.ActionTargets,
-
-			ConcreteActionTriggerNodeFunc: func(node *nodeAbstractActionTrigger, timing RelativeActionTiming) dag.Vertex {
-				return &nodeActionTriggerApplyExpand{
-					nodeAbstractActionTrigger: node,
-
-					relativeTiming: timing,
-				}
-			},
-		},
-
-		&ActionInvokeApplyTransformer{
-			Config:        b.Config,
-			Operation:     b.Operation,
-			ActionTargets: b.ActionTargets,
-			Changes:       b.Changes,
+			Concrete:     concreteResourceInstance,
+			State:        b.State,
+			Changes:      b.Changes,
+			Config:       b.Config,
+			PolicyClient: b.PolicyClient,
 		},
 
 		&ActionDiffTransformer{
@@ -243,6 +223,12 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		// done its thing.
 		&checkStartTransformer{Config: b.Config, Operation: b.Operation},
 
+		// Destruction ordering
+		&DestroyEdgeTransformer{
+			Changes:   b.Changes,
+			Operation: b.Operation,
+		},
+
 		// Detect when create_before_destroy must be forced on for a particular
 		// node due to dependency edges, to avoid graph cycles during apply.
 		//
@@ -252,11 +238,6 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		// no state value, and we end up recalculating CBD for all nodes.
 		&ForcedCBDTransformer{},
 
-		// Destruction ordering
-		&DestroyEdgeTransformer{
-			Changes:   b.Changes,
-			Operation: b.Operation,
-		},
 		&CBDEdgeTransformer{
 			Config: b.Config,
 			State:  b.State,
@@ -270,7 +251,7 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 		},
 
 		// Target
-		&TargetsTransformer{Targets: b.Targets, ActionTargets: b.ActionTargets},
+		&TargetsTransformer{Targets: slices.Concat(b.Targets, b.ActionTargets)},
 
 		// Close any ephemeral resource instances.
 		&ephemeralResourceCloseTransformer{},

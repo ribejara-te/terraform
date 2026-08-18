@@ -15,7 +15,6 @@ const (
 	MessageResourceDrift           MessageType = "resource_drift"
 	MessagePlannedChange           MessageType = "planned_change"
 	MessagePlannedActionInvocation MessageType = "planned_action_invocation"
-	MessageAppliedActionInvocation MessageType = "applied_action_invocation"
 	MessageChangeSummary           MessageType = "change_summary"
 	MessageOutputs                 MessageType = "outputs"
 
@@ -59,4 +58,24 @@ const (
 	MessageActionProgress MessageType = "action_progress"
 	MessageActionComplete MessageType = "action_complete"
 	MessageActionErrored  MessageType = "action_errored"
+
+	// Policy messages
+	MessagePolicyInfo             MessageType = "policy_info"
+	MessagePolicyDiagnostic       MessageType = "policy_diagnostic"
+	MessagePolicyEvaluationResult MessageType = "policy_result"
+	MessagePolicyQuerySummary     MessageType = "policy_query_summary"
+
+	// Provider installation messages
+	InstallProvidersStart          MessageType = "provider_installation_start"
+	InstallStateStoreProviderStart MessageType = "state_store_provider_installation_start"
+
+	// Dependency lock file messages
+	// Uses provider-oriented language in case we add a module lock file in future.
+	ProviderLockfileCreated MessageType = "provider_lockfile_created"
+	ProviderLockfileUpdated MessageType = "provider_lockfile_updated"
+
+	// Provider trust-related message (currently used only in PSS context)
+	ProviderInteractiveApproval  MessageType = "provider_interactive_approval"
+	ProviderInteractiveRejection MessageType = "provider_interactive_rejection"
+	ProviderAutomaticApproval    MessageType = "provider_automatic_approval"
 )
