@@ -12,12 +12,13 @@ import (
 )
 
 type ModuleTransformer struct {
-	Config *configs.Config
-	Walker configs.ModuleWalker
+	Config           *configs.Config
+	Walker           configs.ModuleWalker
+	ModulePathPrefix addrs.Module
 }
 
 func (t *ModuleTransformer) Transform(graph *Graph) error {
-	if t.Config == nil {
+	if t.Config == nil || t.Walker == nil {
 		return nil
 	}
 
@@ -35,10 +36,11 @@ func (t *ModuleTransformer) Transform(graph *Graph) error {
 
 func (t *ModuleTransformer) transform(graph *Graph, cfg *configs.Config, path addrs.ModuleInstance, modCall *configs.ModuleCall) error {
 	n := &nodeInstallModule{
-		Addr:       path,
-		ModuleCall: modCall,
-		Parent:     cfg,
-		Walker:     t.Walker,
+		Addr:             path,
+		ModuleCall:       modCall,
+		Parent:           cfg,
+		Walker:           t.Walker,
+		ModulePathPrefix: t.ModulePathPrefix,
 	}
 	var installNode dag.Vertex = n
 	graph.Add(installNode)

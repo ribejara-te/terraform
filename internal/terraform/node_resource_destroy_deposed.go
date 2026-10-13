@@ -6,6 +6,7 @@ package terraform
 import (
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -44,13 +45,9 @@ type NodePlanDeposedResourceInstanceObject struct {
 	// for any instances.
 	skipPlanChanges bool
 
-	// forgetResources lists resources that should not be destroyed, only removed
-	// from state.
-	forgetResources []addrs.ConfigResource
-
-	// forgetModules lists modules that should not be destroyed, only removed
-	// from state.
-	forgetModules []addrs.Module
+	// forget lists the modules and resources whose instances should not be
+	// destroyed, only removed from state.
+	forget []addrs.Targetable
 }
 
 var (
@@ -118,17 +115,9 @@ func (n *NodePlanDeposedResourceInstanceObject) Execute(ctx EvalContext, op walk
 		return diags
 	}
 
-	var forget bool
-	for _, ft := range n.forgetResources {
-		if ft.Equal(n.ResourceAddr()) {
-			forget = true
-		}
-	}
-	for _, fm := range n.forgetModules {
-		if fm.TargetContains(n.Addr) {
-			forget = true
-		}
-	}
+	forget := slices.ContainsFunc(n.forget, func(addr addrs.Targetable) bool {
+		return addr.Contains(n.Addr)
+	})
 
 	// We don't refresh during the planDestroy walk, since that is only adding
 	// the destroy changes to the plan and the provider will not be configured
@@ -287,24 +276,20 @@ func (n *NodeDestroyDeposedResourceInstanceObject) Execute(ctx EvalContext, op w
 		return diags
 	}
 
-	var change *plans.ResourceInstanceChange
-	var destroyPlanDiags tfdiags.Diagnostics
-	var deferred *providers.Deferred
-	if resourceLifecycleForget(n.Config) {
-		change, destroyPlanDiags = n.planForget(ctx, state, n.DeposedKey)
-	} else {
-		change, deferred, destroyPlanDiags = n.planDestroy(ctx, state, n.DeposedKey)
-	}
+	change, deferred, destroyPlanDiags := n.planDestroy(ctx, state, n.DeposedKey)
 	diags = diags.Append(destroyPlanDiags)
 	if diags.HasErrors() {
 		return diags
 	}
 
+	// Deferral is decided during planning, and this object's destroy was not
+	// deferred, so the provider must not defer it now.
 	if deferred != nil {
-		ctx.Deferrals().ReportResourceInstanceDeferred(n.Addr, deferred.Reason, change)
-		return diags
-	} else if ctx.Deferrals().ShouldDeferResourceInstanceChanges(n.Addr, n.Dependencies) {
-		ctx.Deferrals().ReportResourceInstanceDeferred(n.Addr, providers.DeferredReasonDeferredPrereq, change)
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Resource deferred during apply, but not during plan",
+			fmt.Sprintf("Terraform has encountered a bug where a provider would mark the deposed object %s of %q as deferred during apply, but not during plan. This is most likely a bug in the provider. Please file an issue with the provider.", n.DeposedKey, n.Addr),
+		))
 		return diags
 	}
 
@@ -359,6 +344,7 @@ var (
 	_ GraphNodeDeposedResourceInstanceObject = (*NodeForgetDeposedResourceInstanceObject)(nil)
 	_ GraphNodeConfigResource                = (*NodeForgetDeposedResourceInstanceObject)(nil)
 	_ GraphNodeResourceInstance              = (*NodeForgetDeposedResourceInstanceObject)(nil)
+	_ GraphNodeCreateBeforeDestroy           = (*NodeForgetDeposedResourceInstanceObject)(nil)
 	_ GraphNodeReferenceable                 = (*NodeForgetDeposedResourceInstanceObject)(nil)
 	_ GraphNodeReferencer                    = (*NodeForgetDeposedResourceInstanceObject)(nil)
 	_ GraphNodeExecutable                    = (*NodeForgetDeposedResourceInstanceObject)(nil)
@@ -373,6 +359,16 @@ func (n *NodeForgetDeposedResourceInstanceObject) Name() string {
 
 func (n *NodeForgetDeposedResourceInstanceObject) DestroyAddr() *addrs.AbsResourceInstance {
 	return &n.Addr
+}
+
+func (n *NodeForgetDeposedResourceInstanceObject) CreateBeforeDestroy() bool {
+	// A deposed instance is always CreateBeforeDestroy by definition, since
+	// we use deposed only to handle create-before-destroy.
+	return true
+}
+
+func (n *NodeForgetDeposedResourceInstanceObject) ForceCreateBeforeDestroy() {
+	// noop because deposed instances are always CBD
 }
 
 func (n *NodeForgetDeposedResourceInstanceObject) DeposedInstanceObjectKey() states.DeposedKey {

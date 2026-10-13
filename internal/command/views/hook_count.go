@@ -63,6 +63,8 @@ func (h *countHook) PostApply(id terraform.HookResourceIdentity, dk addrs.Depose
 				case plans.CreateThenDelete, plans.DeleteThenCreate:
 					h.Added++
 					h.Removed++
+				case plans.ForgetThenCreate, plans.CreateThenForget:
+					h.Added++
 				case plans.Create:
 					h.Added++
 				case plans.Delete:
@@ -77,7 +79,7 @@ func (h *countHook) PostApply(id terraform.HookResourceIdentity, dk addrs.Depose
 	return terraform.HookActionContinue, nil
 }
 
-func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value, err error) (terraform.HookAction, error) {
+func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, err error) (terraform.HookAction, error) {
 	h.Lock()
 	defer h.Unlock()
 
@@ -94,6 +96,8 @@ func (h *countHook) PostDiff(id terraform.HookResourceIdentity, dk addrs.Deposed
 	switch action {
 	case plans.CreateThenDelete, plans.DeleteThenCreate:
 		h.ToRemoveAndAdd += 1
+	case plans.ForgetThenCreate, plans.CreateThenForget:
+		h.ToAdd += 1
 	case plans.Create:
 		h.ToAdd += 1
 	case plans.Delete:

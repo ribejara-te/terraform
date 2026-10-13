@@ -53,10 +53,19 @@ type PlanOpts struct {
 	// pre-destroy plan removed entirely.
 	PreDestroyRefresh bool
 
+	// MinimalRefresh will run an initial plan for each resource prior to refreshing:
+	//   - If the plan indicates a no-op, then the no-op plan will be returned without refreshing the resource.
+	//   - If the plan indicates a change (anything but no-op), then the resource will be refreshed and another plan will be run.
+	MinimalRefresh bool
+
 	// SetVariables are the raw values for root module variables as provided
 	// by the user who is requesting the run, prior to any normalization or
 	// substitution of defaults. See the documentation for the InputValue
 	// type for more information on how to correctly populate this.
+	// Variables that are declared but not set are also included here,
+	// but their values are set to nil, so that Terraform Core
+	// can later substitute a default if available, or generate an error
+	// if not.
 	SetVariables InputValues
 
 	// If Targets has a non-zero length then it activates targeted planning
@@ -67,7 +76,7 @@ type PlanOpts struct {
 	// Targeted planning mode is intended for exceptional use only,
 	// and so populating this field will cause Terraform to generate extra
 	// warnings as part of the planning result.
-	Targets []addrs.Targetable
+	Targets []addrs.TargetPattern
 
 	// ActionTargets represents the actions that should be triggered by this
 	// execution. This is incompatible with the `Targets` attribute, only one
@@ -75,7 +84,7 @@ type PlanOpts struct {
 	// ActionTargets.
 	//
 	// TEMP: For now, only support a single entry in this slice.
-	ActionTargets []addrs.Targetable
+	ActionTargets []addrs.TargetPattern
 
 	// ForceReplace is a set of resource instance addresses whose corresponding
 	// objects should be forced planned for replacement if the provider's
@@ -162,6 +171,12 @@ type PlanOpts struct {
 	// or test runtimes, where the root modules as Terraform sees them aren't
 	// the actual root modules.
 	AllowRootEphemeralOutputs bool
+
+	// AllowRootDeprecatedOutputs overrides a specific check made within the
+	// output nodes that they cannot be deprecated for root modules. This
+	// should be set to true for plans executing from within the test runtime,
+	// where the root module as Terraform sees it isn't the actual root module.
+	AllowRootDeprecatedOutputs bool
 
 	// ProviderLocks is a read-only snapshot of provider locks (from the dependency lock
 	// file).
@@ -289,6 +304,29 @@ func (c *Context) PlanAndEval(config *configs.Config, prevRunState *states.State
 				tfdiags.Error,
 				"Incompatible plan options",
 				"Must be in RefreshOnlyMode when invoking actions. This is a bug in Terraform.",
+			))
+			return nil, nil, diags
+		}
+	}
+
+	if opts.MinimalRefresh {
+		if opts.Mode != plans.NormalMode && opts.Mode != plans.DestroyMode {
+			// The CLI layer (and other similar callers) should prevent this
+			// combination of options.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Incompatible plan options",
+				fmt.Sprintf("The -minimal-refresh planning option is only allowed in normal or destroy planning modes, got %s. This is a bug in Terraform.", opts.Mode),
+			))
+			return nil, nil, diags
+		}
+		if opts.SkipRefresh {
+			// The CLI layer (and other similar callers) should prevent this
+			// combination of options.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Incompatible plan options",
+				"The -minimal-refresh planning option cannot be combined with skipping refresh, because it only affects whether Terraform refreshes. This is a bug in Terraform.",
 			))
 			return nil, nil, diags
 		}
@@ -543,6 +581,12 @@ func (c *Context) destroyPlan(config *configs.Config, prevRunState *states.State
 		panic(fmt.Sprintf("called Context.destroyPlan with %s", opts.Mode))
 	}
 
+	// During a plan there isn't a way for providers to indicate that a refresh is needed or not prior to attempting
+	// to destroy a resource instance, so -minimal-refresh optimizes to skip refresh.
+	if !opts.SkipRefresh && opts.MinimalRefresh {
+		opts.SkipRefresh = true
+	}
+
 	priorState := prevRunState
 
 	// A destroy plan starts by running Refresh to read any pending data
@@ -635,7 +679,7 @@ func (c *Context) prePlanFindAndApplyMoves(config *configs.Config, prevRunState 
 	return moveStmts, moveResults, diags
 }
 
-func (c *Context) prePlanVerifyTargetedMoves(moveResults refactoring.MoveResults, targets []addrs.Targetable) tfdiags.Diagnostics {
+func (c *Context) prePlanVerifyTargetedMoves(moveResults refactoring.MoveResults, targets []addrs.TargetPattern) tfdiags.Diagnostics {
 	if len(targets) < 1 {
 		return nil // the following only matters when targeting
 	}
@@ -647,10 +691,10 @@ func (c *Context) prePlanVerifyTargetedMoves(moveResults refactoring.MoveResults
 		fromMatchesTarget := false
 		toMatchesTarget := false
 		for _, targetAddr := range targets {
-			if targetAddr.TargetContains(result.From) {
+			if targetAddr.Contains(result.From) {
 				fromMatchesTarget = true
 			}
-			if targetAddr.TargetContains(result.To) {
+			if targetAddr.Contains(result.To) {
 				toMatchesTarget = true
 			}
 		}
@@ -712,7 +756,7 @@ func (c *Context) postPlanValidateMoves(config *configs.Config, stmts []refactor
 func (c *Context) findImportTargets(config *configs.Config) []*ImportTarget {
 	var importTargets []*ImportTarget
 	importStatements := refactoring.FindImportStatements(config)
-	for _, ic := range importStatements.Values() {
+	for _, ic := range importStatements {
 		importTargets = append(importTargets, &ImportTarget{
 			Config:              ic.Import,
 			RelModule:           ic.ContainingModule,
@@ -722,27 +766,26 @@ func (c *Context) findImportTargets(config *configs.Config) []*ImportTarget {
 	return importTargets
 }
 
-// findForgetTargets builds a list of resources and a list of modules to be
+// findForgetTargets builds a list of the modules and resources to be
 // forgotten, based on any removed blocks in config.
-func (c *Context) findForgetTargets(config *configs.Config) (forgetResources []addrs.ConfigResource, forgetModules []addrs.Module, diags tfdiags.Diagnostics) {
+func (c *Context) findForgetTargets(config *configs.Config) ([]addrs.Targetable, tfdiags.Diagnostics) {
 	removeStmts, diags := refactoring.FindRemoveStatements(config)
 	if diags.HasErrors() {
-		return nil, nil, diags
+		return nil, diags
 	}
+
+	var forget []addrs.Targetable
 	for _, rst := range removeStmts.Values() {
 		if rst.Destroy {
-			// no-op
-		} else {
-			if fr, ok := rst.From.(addrs.ConfigResource); ok {
-				forgetResources = append(forgetResources, fr)
-			} else if fm, ok := rst.From.(addrs.Module); ok {
-				forgetModules = append(forgetModules, fm)
-			} else {
-				panic("Invalid ConfigMoveable type in remove statement")
-			}
+			continue
 		}
+		addr, ok := rst.From.(addrs.Targetable)
+		if !ok {
+			panic(fmt.Sprintf("invalid address %s in remove statement", rst.From))
+		}
+		forget = append(forget, addr)
 	}
-	return forgetResources, forgetModules, diags
+	return forget, diags
 }
 
 func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, opts *PlanOpts, moduleAddr addrs.ModuleInstance) (*plans.Plan, *lang.Scope, tfdiags.Diagnostics) {
@@ -856,7 +899,7 @@ func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, o
 
 	var forgottenResources []string
 	for _, rc := range changes.Resources {
-		if rc.Action == plans.Forget || rc.Action == plans.CreateThenForget {
+		if rc.Action == plans.Forget || rc.Action == plans.ForgetThenCreate || rc.Action == plans.CreateThenForget {
 			// TODO KEM display resource ids
 			forgottenResources = append(forgottenResources, fmt.Sprintf(" - %s", rc.Addr))
 		}
@@ -961,6 +1004,10 @@ func (c *Context) deferredResources(schemas *Schemas, deferrals []*plans.Deferre
 	var deferredResources []*plans.DeferredResourceInstanceChangeSrc
 
 	for _, deferral := range deferrals {
+		if deferral.Change == nil {
+			// we only need to report deferrals with planned changes.
+			continue
+		}
 		schema := schemas.ResourceTypeConfig(
 			deferral.Change.ProviderAddr.Provider,
 			deferral.Change.Addr.Resource.Resource.Mode,
@@ -1014,68 +1061,73 @@ func (c *Context) planGraph(config *configs.Config, prevRunState *states.State, 
 	case plans.NormalMode:
 		// In Normal mode we need to pay attention to import and removed blocks
 		// in config so their targets can be added to the graph.
-		forgetResources, forgetModules, diags := c.findForgetTargets(config)
+		forget, diags := c.findForgetTargets(config)
 		if diags.HasErrors() {
 			return nil, walkPlan, diags
 		}
 		graph, diags := (&PlanGraphBuilder{
-			Config:                    config,
-			State:                     prevRunState,
-			RootVariableValues:        opts.SetVariables,
-			ExternalProviderConfigs:   externalProviderConfigs,
-			Plugins:                   c.plugins,
-			Targets:                   opts.Targets,
-			ForceReplace:              opts.ForceReplace,
-			skipRefresh:               opts.SkipRefresh,
-			preDestroyRefresh:         opts.PreDestroyRefresh,
-			Operation:                 walkPlan,
-			ExternalReferences:        opts.ExternalReferences,
-			Overrides:                 opts.Overrides,
-			ImportTargets:             c.findImportTargets(config),
-			forgetResources:           forgetResources,
-			forgetModules:             forgetModules,
-			GenerateConfigPath:        opts.GenerateConfigPath,
-			SkipGraphValidation:       c.graphOpts.SkipGraphValidation,
-			queryPlan:                 opts.Query,
-			overridePreventDestroy:    opts.OverridePreventDestroy,
-			AllowRootEphemeralOutputs: opts.AllowRootEphemeralOutputs,
-			PolicyClient:              opts.PolicyClient,
+			Config:                     config,
+			State:                      prevRunState,
+			RootVariableValues:         opts.SetVariables,
+			ExternalProviderConfigs:    externalProviderConfigs,
+			Plugins:                    c.plugins,
+			Targets:                    opts.Targets,
+			ForceReplace:               opts.ForceReplace,
+			skipRefresh:                opts.SkipRefresh,
+			preDestroyRefresh:          opts.PreDestroyRefresh,
+			minimalRefresh:             opts.MinimalRefresh,
+			Operation:                  walkPlan,
+			ExternalReferences:         opts.ExternalReferences,
+			Overrides:                  opts.Overrides,
+			ImportTargets:              c.findImportTargets(config),
+			forget:                     forget,
+			GenerateConfigPath:         opts.GenerateConfigPath,
+			SkipGraphValidation:        c.graphOpts.SkipGraphValidation,
+			queryPlan:                  opts.Query,
+			overridePreventDestroy:     opts.OverridePreventDestroy,
+			AllowRootEphemeralOutputs:  opts.AllowRootEphemeralOutputs,
+			AllowRootDeprecatedOutputs: opts.AllowRootDeprecatedOutputs,
+			PolicyClient:               opts.PolicyClient,
 		}).Build(addrs.RootModuleInstance)
 		return graph, walkPlan, diags
 	case plans.RefreshOnlyMode:
 		graph, diags := (&PlanGraphBuilder{
-			Config:                    config,
-			State:                     prevRunState,
-			RootVariableValues:        opts.SetVariables,
-			ExternalProviderConfigs:   externalProviderConfigs,
-			Plugins:                   c.plugins,
-			Targets:                   opts.Targets,
-			ActionTargets:             opts.ActionTargets,
-			skipRefresh:               opts.SkipRefresh,
-			skipPlanChanges:           true, // this activates "refresh only" mode.
-			Operation:                 walkPlan,
-			ExternalReferences:        opts.ExternalReferences,
-			Overrides:                 opts.Overrides,
-			SkipGraphValidation:       c.graphOpts.SkipGraphValidation,
-			AllowRootEphemeralOutputs: opts.AllowRootEphemeralOutputs,
-			PolicyClient:              opts.PolicyClient,
+			Config:                     config,
+			State:                      prevRunState,
+			RootVariableValues:         opts.SetVariables,
+			ExternalProviderConfigs:    externalProviderConfigs,
+			Plugins:                    c.plugins,
+			Targets:                    opts.Targets,
+			ActionTargets:              opts.ActionTargets,
+			skipRefresh:                opts.SkipRefresh,
+			skipPlanChanges:            true, // this activates "refresh only" mode.
+			minimalRefresh:             opts.MinimalRefresh,
+			Operation:                  walkPlan,
+			ExternalReferences:         opts.ExternalReferences,
+			Overrides:                  opts.Overrides,
+			SkipGraphValidation:        c.graphOpts.SkipGraphValidation,
+			AllowRootEphemeralOutputs:  opts.AllowRootEphemeralOutputs,
+			AllowRootDeprecatedOutputs: opts.AllowRootDeprecatedOutputs,
+			PolicyClient:               opts.PolicyClient,
 		}).Build(addrs.RootModuleInstance)
 		return graph, walkPlan, diags
 	case plans.DestroyMode:
 		graph, diags := (&PlanGraphBuilder{
-			Config:                    config,
-			State:                     prevRunState,
-			RootVariableValues:        opts.SetVariables,
-			ExternalProviderConfigs:   externalProviderConfigs,
-			Plugins:                   c.plugins,
-			Targets:                   opts.Targets,
-			skipRefresh:               opts.SkipRefresh,
-			Operation:                 walkPlanDestroy,
-			Overrides:                 opts.Overrides,
-			SkipGraphValidation:       c.graphOpts.SkipGraphValidation,
-			overridePreventDestroy:    opts.OverridePreventDestroy,
-			AllowRootEphemeralOutputs: opts.AllowRootEphemeralOutputs,
-			PolicyClient:              opts.PolicyClient,
+			Config:                     config,
+			State:                      prevRunState,
+			RootVariableValues:         opts.SetVariables,
+			ExternalProviderConfigs:    externalProviderConfigs,
+			Plugins:                    c.plugins,
+			Targets:                    opts.Targets,
+			skipRefresh:                opts.SkipRefresh,
+			minimalRefresh:             opts.MinimalRefresh,
+			Operation:                  walkPlanDestroy,
+			Overrides:                  opts.Overrides,
+			SkipGraphValidation:        c.graphOpts.SkipGraphValidation,
+			overridePreventDestroy:     opts.OverridePreventDestroy,
+			AllowRootEphemeralOutputs:  opts.AllowRootEphemeralOutputs,
+			AllowRootDeprecatedOutputs: opts.AllowRootDeprecatedOutputs,
+			PolicyClient:               opts.PolicyClient,
 		}).Build(addrs.RootModuleInstance)
 		return graph, walkPlanDestroy, diags
 	default:

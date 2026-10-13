@@ -96,7 +96,7 @@ func (v *OperationHuman) EmergencyDumpState(stateFile *statefile.File) error {
 }
 
 func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
-	outputs, changed, drift, attrs, actions, err := jsonplan.MarshalForRenderer(plan, schemas)
+	jsonPlan, err := jsonplan.MarshalForRenderer(plan, schemas)
 	if err != nil {
 		v.view.streams.Eprintf("Failed to marshal plan to json: %s", err)
 		return
@@ -111,12 +111,13 @@ func (v *OperationHuman) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	jplan := jsonformat.Plan{
 		PlanFormatVersion:     jsonplan.FormatVersion,
 		ProviderFormatVersion: jsonprovider.FormatVersion,
-		OutputChanges:         outputs,
-		ResourceChanges:       changed,
-		ResourceDrift:         drift,
+		OutputChanges:         jsonPlan.OutputChanges,
+		ResourceChanges:       jsonPlan.ResourceChanges,
+		ResourceDrift:         jsonPlan.ResourceDrift,
 		ProviderSchemas:       jsonprovider.MarshalForRenderer(schemas),
-		RelevantAttributes:    attrs,
-		ActionInvocations:     actions,
+		RelevantAttributes:    jsonPlan.RelevantAttributes,
+		ActionInvocations:     jsonPlan.ActionInvocations,
+		DeferredChanges:       jsonPlan.DeferredChanges,
 	}
 
 	// Side load some data that we can't extract from the JSON plan.
@@ -260,6 +261,8 @@ func (v *OperationJSON) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 		case plans.CreateThenDelete, plans.DeleteThenCreate:
 			cs.Add++
 			cs.Remove++
+		case plans.ForgetThenCreate, plans.CreateThenForget:
+			cs.Add++
 		}
 
 		if change.Action != plans.NoOp || !change.Addr.Equal(change.PrevRunAddr) || change.Importing != nil {
@@ -282,6 +285,10 @@ func (v *OperationJSON) Plan(plan *plans.Plan, schemas *terraform.Schemas) {
 	}
 	if len(rootModuleOutputs) > 0 {
 		v.view.Outputs(json.OutputsFromChanges(rootModuleOutputs))
+	}
+
+	for _, deferredChange := range plan.DeferredResources {
+		v.view.DeferredChange(json.NewDeferredResourceInstanceChange(deferredChange))
 	}
 }
 

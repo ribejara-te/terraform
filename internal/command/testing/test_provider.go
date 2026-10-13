@@ -37,6 +37,7 @@ var (
 						"value":                {Type: cty.String, Optional: true},
 						"interrupt_count":      {Type: cty.Number, Optional: true},
 						"destroy_fail":         {Type: cty.Bool, Optional: true, Computed: true},
+						"apply_fail":           {Type: cty.Bool, Optional: true},
 						"create_wait_seconds":  {Type: cty.Number, Optional: true},
 						"destroy_wait_seconds": {Type: cty.Number, Optional: true},
 						"write_only":           {Type: cty.String, Optional: true, WriteOnly: true},
@@ -60,6 +61,7 @@ var (
 
 						"interrupt_count":      {Type: cty.Number, Computed: true},
 						"destroy_fail":         {Type: cty.Bool, Computed: true},
+						"apply_fail":           {Type: cty.Bool, Optional: true},
 						"create_wait_seconds":  {Type: cty.Number, Computed: true},
 						"destroy_wait_seconds": {Type: cty.Number, Computed: true},
 						"defer":                {Type: cty.Bool, Computed: true},
@@ -209,6 +211,16 @@ func (provider *TestProvider) count(prefix string) int {
 	return count
 }
 
+func (provider *TestProvider) Resources() []string {
+	var keys []string
+	for key := range provider.Store.Data {
+		if strings.HasPrefix(key, provider.ResourcePrefix()) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
 func (provider *TestProvider) string(prefix string) string {
 	defer provider.Store.beginRead()()
 
@@ -335,6 +347,15 @@ func (provider *TestProvider) ApplyResourceChange(request providers.ApplyResourc
 		vals := resource.AsValueMap()
 		vals["destroy_fail"] = cty.False
 		resource = cty.ObjectVal(vals)
+	}
+
+	if applyFail := resource.GetAttr("apply_fail"); !applyFail.IsNull() && applyFail.IsKnown() && applyFail.True() {
+		var diags tfdiags.Diagnostics
+		diags = diags.Append(fmt.Errorf("apply_fail is set to true"))
+		return providers.ApplyResourceChangeResponse{
+			NewState:    cty.NilVal,
+			Diagnostics: diags,
+		}
 	}
 
 	provider.Store.Put(provider.GetResourceKey(id.AsString()), resource)

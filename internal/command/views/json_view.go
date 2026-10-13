@@ -27,12 +27,10 @@ func NewJSONView(view *View) *JSONView {
 		Output:     view.streams.Stdout.File,
 		JSONFormat: true,
 	})
-	jv := &JSONView{
+	return &JSONView{
 		log:  log,
 		view: view,
 	}
-	jv.Version()
-	return jv
 }
 
 type JSONView struct {
@@ -94,6 +92,14 @@ func (v *JSONView) PlannedChange(c *json.ResourceInstanceChange) {
 		c.String(),
 		"type", json.MessagePlannedChange,
 		"change", c,
+	)
+}
+
+func (v *JSONView) DeferredChange(dc *json.DeferredResourceInstanceChange) {
+	v.log.Info(
+		dc.String(),
+		"type", json.MessageDeferredChange,
+		"deferred_change", dc,
 	)
 }
 
@@ -178,7 +184,7 @@ func (v *JSONView) logPolicyResult(addr string, resp policy.EvaluationResponse) 
 	}
 }
 
-func (v *JSONView) logPolicyQuerySummary(summary queryPolicySummary) {
+func (v *JSONView) logPolicyQuerySummary(summary PolicyQuerySummary) {
 	v.log.Info(
 		"Policy query summary",
 		"type", json.MessagePolicyQuerySummary,

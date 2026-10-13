@@ -55,9 +55,9 @@ const (
 	DeferredReasonAbsentPrereq          = "absent_prereq"
 )
 
-// plan is the top-level representation of the json format of a plan. It includes
+// Plan is the top-level representation of the json format of a plan. It includes
 // the complete config and current state.
-type plan struct {
+type Plan struct {
 	FormatVersion    string      `json:"format_version,omitempty"`
 	TerraformVersion string      `json:"terraform_version,omitempty"`
 	Variables        variables   `json:"variables,omitempty"`
@@ -80,8 +80,8 @@ type plan struct {
 	Errored                   bool                       `json:"errored"`
 }
 
-func newPlan() *plan {
-	return &plan{
+func newPlan() *Plan {
+	return &Plan{
 		FormatVersion: FormatVersion,
 	}
 }
@@ -250,19 +250,16 @@ type variable struct {
 //
 // This function does a small part of the Marshal function, as it only returns
 // the part of the plan required by the jsonformat.Plan renderer.
-func MarshalForRenderer(
-	p *plans.Plan,
-	schemas *terraform.Schemas,
-) (map[string]Change, []ResourceChange, []ResourceChange, []ResourceAttr, []ActionInvocation, error) {
+func MarshalForRenderer(p *plans.Plan, schemas *terraform.Schemas) (*Plan, error) {
 	output := newPlan()
 
 	var err error
 	if output.OutputChanges, err = MarshalOutputChanges(p.Changes); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, err
 	}
 
 	if output.ResourceChanges, err = MarshalResourceChanges(p.Changes.Resources, schemas); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, err
 	}
 
 	if len(p.DriftedResources) > 0 {
@@ -282,19 +279,26 @@ func MarshalForRenderer(
 		}
 		output.ResourceDrift, err = MarshalResourceChanges(driftedResources, schemas)
 		if err != nil {
-			return nil, nil, nil, nil, nil, err
+			return nil, err
 		}
 	}
 
 	if err := output.marshalRelevantAttrs(p); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, err
 	}
 
 	if output.ActionInvocations, err = MarshalActionInvocations(p.Changes.ActionInvocations, schemas); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, err
 	}
 
-	return output.OutputChanges, output.ResourceChanges, output.ResourceDrift, output.RelevantAttributes, output.ActionInvocations, nil
+	if len(p.DeferredResources) > 0 {
+		output.DeferredChanges, err = MarshalDeferredResourceChanges(p.DeferredResources, schemas)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return output, nil
 }
 
 // Marshal returns the json encoding of a terraform plan.
@@ -404,7 +408,7 @@ func Marshal(
 	return json.Marshal(output)
 }
 
-func (p *plan) marshalPlanVariables(vars map[string]plans.DynamicValue, decls map[string]*configs.Variable) error {
+func (p *Plan) marshalPlanVariables(vars map[string]plans.DynamicValue, decls map[string]*configs.Variable) error {
 	p.Variables = make(variables, len(vars))
 
 	for k, v := range vars {
@@ -848,7 +852,7 @@ func MarshalOutputChanges(changes *plans.ChangesSrc) (map[string]Change, error) 
 	return outputChanges, nil
 }
 
-func (p *plan) marshalPlannedValues(changes *plans.ChangesSrc, schemas *terraform.Schemas) error {
+func (p *Plan) marshalPlannedValues(changes *plans.ChangesSrc, schemas *terraform.Schemas) error {
 	// marshal the planned changes into a module
 	plan, err := marshalPlannedValues(changes, schemas)
 	if err != nil {
@@ -866,7 +870,7 @@ func (p *plan) marshalPlannedValues(changes *plans.ChangesSrc, schemas *terrafor
 	return nil
 }
 
-func (p *plan) marshalRelevantAttrs(plan *plans.Plan) error {
+func (p *Plan) marshalRelevantAttrs(plan *plans.Plan) error {
 	for _, ra := range plan.RelevantAttributes {
 		addr := ra.Resource.String()
 		path, err := encodePath(ra.Attr)
@@ -1037,6 +1041,8 @@ func actionString(action string) []string {
 		return []string{"delete", "create"}
 	case action == "Forget":
 		return []string{"forget"}
+	case action == "ForgetThenCreate":
+		return []string{"forget", "create"}
 	case action == "CreateThenForget":
 		return []string{"create", "forget"}
 	default:
@@ -1057,6 +1063,10 @@ func UnmarshalActions(actions []string) plans.Action {
 
 		if actions[0] == "create" && actions[1] == "forget" {
 			return plans.CreateThenForget
+		}
+
+		if actions[0] == "forget" && actions[1] == "create" {
+			return plans.ForgetThenCreate
 		}
 	}
 

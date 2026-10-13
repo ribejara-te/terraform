@@ -152,7 +152,7 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 		if diags.HasErrors() {
 			return nil, fmt.Errorf("plan contains invalid target address %q: %s", rawTargetAddr, diags.Err())
 		}
-		plan.TargetAddrs = append(plan.TargetAddrs, target.Subject)
+		plan.TargetAddrs = append(plan.TargetAddrs, target)
 	}
 
 	for _, rawActionAddr := range rawPlan.ActionTargetAddrs {
@@ -160,7 +160,7 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 		if diags.HasErrors() {
 			return nil, fmt.Errorf("plan contains invalid action target address %q: %s", rawActionAddr, diags.Err())
 		}
-		plan.ActionTargetAddrs = append(plan.ActionTargetAddrs, target.Subject)
+		plan.ActionTargetAddrs = append(plan.ActionTargetAddrs, target)
 	}
 
 	for _, rawReplaceAddr := range rawPlan.ForceReplaceAddrs {
@@ -403,6 +403,8 @@ func ActionFromProto(rawAction planproto.Action) (plans.Action, error) {
 		return plans.DeleteThenCreate, nil
 	case planproto.Action_FORGET:
 		return plans.Forget, nil
+	case planproto.Action_FORGET_THEN_CREATE:
+		return plans.ForgetThenCreate, nil
 	case planproto.Action_CREATE_THEN_FORGET:
 		return plans.CreateThenForget, nil
 	default:
@@ -449,7 +451,7 @@ func changeFromTfplan(rawChange *planproto.Change) (*plans.ChangeSrc, error) {
 		afterIdx = 1
 	case plans.Forget:
 		beforeIdx = 0
-	case plans.CreateThenForget:
+	case plans.ForgetThenCreate, plans.CreateThenForget:
 		beforeIdx = 0
 		afterIdx = 1
 	default:
@@ -930,6 +932,8 @@ func ActionToProto(action plans.Action) (planproto.Action, error) {
 		return planproto.Action_CREATE_THEN_DELETE, nil
 	case plans.Forget:
 		return planproto.Action_FORGET, nil
+	case plans.ForgetThenCreate:
+		return planproto.Action_FORGET_THEN_CREATE, nil
 	case plans.CreateThenForget:
 		return planproto.Action_CREATE_THEN_FORGET, nil
 	default:
@@ -997,7 +1001,7 @@ func changeToTfplan(change *plans.ChangeSrc) (*planproto.Change, error) {
 		ret.Values = []*planproto.DynamicValue{before, after}
 	case planproto.Action_FORGET:
 		ret.Values = []*planproto.DynamicValue{before}
-	case planproto.Action_CREATE_THEN_FORGET:
+	case planproto.Action_FORGET_THEN_CREATE, planproto.Action_CREATE_THEN_FORGET:
 		ret.Values = []*planproto.DynamicValue{before, after}
 	default:
 		return nil, fmt.Errorf("invalid change action %s", change.Action)

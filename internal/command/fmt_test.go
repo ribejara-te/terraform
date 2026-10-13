@@ -526,6 +526,36 @@ func TestFmt_stdinArg(t *testing.T) {
 	}
 }
 
+// This test defines current behaviour, and doesn't mean this is correct behaviour.
+// In future we should add validation in the arguments packages to prevent this being
+// silently ignored, but that will be a breaking change.
+func TestFmt_stdinArgIgnoresFurtherArguments(t *testing.T) {
+	t.Parallel()
+	input := new(bytes.Buffer)
+	input.Write(fmtFixture.input)
+
+	ui := testUiWrapped(t)
+	c := &FmtCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+		input: input,
+	}
+
+	args := []string{
+		"-",
+		"does-not-exist.tf", // Ignored, so it doesn't cause usual error "No file or directory at does-not-exist.tf"
+	}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("wrong exit code. errors: \n%s", ui.ErrorWriter.String())
+	}
+
+	if actual := ui.OutputWriter.Bytes(); !bytes.Equal(actual, fmtFixture.golden) {
+		t.Fatalf("got: %q\nexpected: %q", actual, fmtFixture.golden)
+	}
+}
+
 func TestFmt_nonDefaultOptions(t *testing.T) {
 	t.Parallel()
 	tempDir := fmtFixtureWriteDir(t)
@@ -580,6 +610,83 @@ func TestFmt_check(t *testing.T) {
 
 	if actual := ui.OutputWriter.String(); !strings.Contains(actual, tempDir) {
 		t.Fatalf("expected:\n%s\n\nto include: %q", actual, tempDir)
+	}
+}
+
+// When `fmt` encounters a symlink:
+// * The target is edited
+// * The symlink itself remains a symlink
+// * The target file's permissions are unchanged
+func TestFmt_symlinkedFileAreEdited(t *testing.T) {
+	workingDir := tempWorkingDir(t)
+	t.Chdir(workingDir.RootModuleDir())
+
+	// Create the target of the symlink.
+	otherDir := t.TempDir()
+	target := filepath.Join(otherDir, "main.tf")
+	cfg := `variable "a" {
+default="x"
+  type =    string
+}
+
+locals {
+    b = var.a
+c =   "y"
+}`
+	err := os.WriteFile(target, []byte(cfg), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var perms os.FileMode = 0744
+	if err := os.Chmod(target, perms); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the symlink pointing to the target file.
+	link := filepath.Join(workingDir.RootModuleDir(), "main.tf")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	ui := testUiWrapped(t)
+	c := &FmtCommand{
+		Meta: Meta{
+			Ui:         ui,
+			WorkingDir: workingDir,
+		},
+	}
+
+	if code := c.Run([]string{"-no-color"}); code != 0 {
+		t.Fatalf("unexpected failure with code %d: %s", code, ui.ErrorWriter.String())
+	}
+
+	// The symlink is still a symlink
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+	if fi.Mode().Type() != os.ModeSymlink {
+		t.Fatal("expected the working directory main.tf to still be a symlink")
+	}
+
+	// The target file's permissions are unchanged
+	fi, err = os.Stat(target)
+	if err != nil {
+		t.Fatalf("unexpected error stating target file: %s", err)
+	}
+	if fi.Mode().Perm() != perms {
+		t.Fatalf("expected target file permissions to be %o, got: %o", perms, fi.Mode().Perm())
+	}
+
+	// The symlinked file has been formatted
+	ui = testUiWrapped(t)
+	c.Ui = ui
+	args := []string{
+		"-no-color",
+		"-check",
+	}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("expected `terraform fmt -check` to exit with code 0 due to the file being formatted, got code %d: stdout: %s\nstderr: %s", code, ui.OutputWriter.String(), ui.ErrorWriter.String())
 	}
 }
 

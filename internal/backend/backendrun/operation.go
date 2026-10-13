@@ -78,6 +78,11 @@ type Operation struct {
 	PlanRefresh bool   // PlanRefresh will do a refresh before a plan
 	PlanOutPath string // PlanOutPath is the path to save the plan
 
+	// PlanMinimalRefresh will run an initial plan for each resource prior to refreshing:
+	//   - If the plan indicates a no-op, then the no-op plan will be returned without refreshing the resource.
+	//   - If the plan indicates a change (anything but no-op), then the resource will be refreshed and another plan will be run.
+	PlanMinimalRefresh bool
+
 	// PlanOutBackend is the backend to store with the plan. This is the
 	// backend that will be used when applying the plan.
 	// Only one of PlanOutBackend or PlanOutStateStore may be set.
@@ -118,8 +123,8 @@ type Operation struct {
 	// behavior of the operation.
 	PlanMode             plans.Mode
 	AutoApprove          bool
-	Targets              []addrs.Targetable
-	ActionTargets        []addrs.Targetable
+	Targets              []addrs.TargetPattern
+	ActionTargets        []addrs.TargetPattern
 	ForceReplace         []addrs.AbsResourceInstance
 	Variables            map[string]arguments.UnparsedVariableValue
 	StatePersistInterval int

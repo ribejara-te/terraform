@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	stackparser "github.com/hashicorp/terraform/internal/stacks/stackconfig/parser"
+	"github.com/hashicorp/terraform/internal/stacks/stackmodule"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -108,7 +109,7 @@ func (r *RemovedComponentConfig) CheckModuleTree(ctx context.Context) (*configs.
 		}
 
 		walker := stackparser.NewSourceBundleModuleWalker(rootModuleSource, sources, parser)
-		configRoot, hclDiags := configs.BuildConfig(rootMod, walker, nil)
+		configRoot, hclDiags := stackmodule.BuildConfig(rootMod, walker, nil)
 		diags = diags.Append(hclDiags)
 		if hclDiags.HasErrors() {
 			return nil, diags
@@ -196,8 +197,9 @@ func (r *RemovedComponentConfig) CheckValid(ctx context.Context, phase EvalPhase
 		}()
 
 		diags = diags.Append(tfCtx.Validate(moduleTree, &terraform.ValidateOpts{
-			ExternalProviders:         providerClients,
-			AllowRootEphemeralOutputs: false, // TODO(issues/37822): Enable this.
+			ExternalProviders:          providerClients,
+			AllowRootEphemeralOutputs:  false, // TODO(issues/37822): Enable this.
+			AllowRootDeprecatedOutputs: false, // Stacks does not yet support deprecated values.
 		}))
 		return diags, nil
 	})

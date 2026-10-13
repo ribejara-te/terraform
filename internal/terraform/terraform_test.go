@@ -65,10 +65,13 @@ func testModuleWithSnapshot(t *testing.T, name string) (*configs.Config, *config
 	// We need to be able to exercise experimental features in our integration tests.
 	loader.AllowLanguageExperiments(true)
 
+	initializer := func(rootMod *configs.Module, walker configs.ModuleWalker) (*configs.Config, tfdiags.Diagnostics) {
+		return BuildConfigWithGraph(rootMod, walker, nil, configs.MockDataLoaderFunc(loader.LoadExternalMockData))
+	}
 	// Test modules usually do not refer to remote sources, and for local
 	// sources only this ultimately just records all of the module paths
 	// in a JSON file so that we can load them below.
-	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), nil)
+	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), initializer)
 	_, instDiags := inst.InstallModules(context.Background(), dir, "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())
@@ -125,8 +128,25 @@ func testModuleInline(t testing.TB, sources map[string]string, parserOpts ...con
 }
 
 // testModuleInlineWithVars is the same as testModuleInline but also allows passing in variable values to be used when loading the config.
-func testModuleInlineWithVars(t testing.TB, sources map[string]string, vars InputValues, parserOpts ...configs.Option) *configs.Config {
+func testModuleInlineWithVars(
+	t testing.TB,
+	sources map[string]string,
+	vars InputValues,
+	parserOpts ...configs.Option,
+) *configs.Config {
+	config, diags := testModuleInlineWithVarsReturnDiags(t, sources, vars, parserOpts...)
+	if diags != nil && diags.HasErrors() {
+		t.Fatal(diags.Err())
+	}
+	return config
+}
 
+func testModuleInlineWithVarsReturnDiags(
+	t testing.TB,
+	sources map[string]string,
+	vars InputValues,
+	parserOpts ...configs.Option,
+) (*configs.Config, tfdiags.Diagnostics) {
 	t.Helper()
 
 	cfgPath, err := filepath.EvalSymlinks(t.TempDir())
@@ -161,13 +181,16 @@ func testModuleInlineWithVars(t testing.TB, sources map[string]string, vars Inpu
 	// We need to be able to exercise experimental features in our integration tests.
 	loader.AllowLanguageExperiments(true)
 
+	initializer := func(rootMod *configs.Module, walker configs.ModuleWalker) (*configs.Config, tfdiags.Diagnostics) {
+		return BuildConfigWithGraph(rootMod, walker, vars, configs.MockDataLoaderFunc(loader.LoadExternalMockData))
+	}
 	// Test modules usually do not refer to remote sources, and for local
 	// sources only this ultimately just records all of the module paths
 	// in a JSON file so that we can load them below.
-	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), nil)
+	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), initializer)
 	_, instDiags := inst.InstallModules(context.Background(), cfgPath, "tests", true, false)
 	if instDiags.HasErrors() {
-		t.Fatal(instDiags.Err())
+		return nil, instDiags
 	}
 
 	// Since module installer has modified the module manifest on disk, we need
@@ -178,7 +201,7 @@ func testModuleInlineWithVars(t testing.TB, sources map[string]string, vars Inpu
 
 	rootMod, hclDiags := loader.LoadRootModuleWithTests(cfgPath, "tests")
 	if hclDiags.HasErrors() {
-		t.Fatal(hclDiags.Error())
+		return nil, tfdiags.Diagnostics{}.Append(hclDiags)
 	}
 
 	config, buildDiags := BuildConfigWithGraph(
@@ -188,10 +211,10 @@ func testModuleInlineWithVars(t testing.TB, sources map[string]string, vars Inpu
 		configs.MockDataLoaderFunc(loader.LoadExternalMockData),
 	)
 	if buildDiags.HasErrors() {
-		t.Fatal(buildDiags.Err())
+		return nil, buildDiags
 	}
 
-	return config
+	return config, nil
 }
 
 func testRootModuleInline(t testing.TB, sources map[string]string, ignoreParsingErrors bool) *configs.Module {
@@ -359,12 +382,23 @@ func mustActionInstanceAddr(s string) addrs.AbsActionInstance {
 	return addr
 }
 
-func mustActionAddr(s string) addrs.AbsAction {
-	addr, diags := addrs.ParseAbsActionStr(s)
+// mustTargetPattern parses a target in the same way as the -target option.
+func mustTargetPattern(s string) addrs.TargetPattern {
+	target, diags := addrs.ParseTargetStr(s)
 	if diags.HasErrors() {
 		panic(diags.Err())
 	}
-	return addr
+	return target
+}
+
+// mustActionTargetPattern parses a target in the same way as the -invoke
+// option.
+func mustActionTargetPattern(s string) addrs.TargetPattern {
+	target, diags := addrs.ParseTargetActionStr(s)
+	if diags.HasErrors() {
+		panic(diags.Err())
+	}
+	return target
 }
 
 // HookRecordApplyOrder is a test hook that records the order of applies

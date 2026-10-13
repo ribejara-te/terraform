@@ -19,6 +19,8 @@ type InitGraphBuilder struct {
 	RootVariableValues InputValues
 
 	Walker configs.ModuleWalker
+
+	ModulePathPrefix addrs.Module
 }
 
 // See GraphBuilder
@@ -50,8 +52,13 @@ func (b *InitGraphBuilder) Steps() []GraphTransformer {
 
 	steps = append(steps, []GraphTransformer{
 		&ModuleTransformer{
+			Config:           b.Config,
+			Walker:           b.Walker,
+			ModulePathPrefix: b.ModulePathPrefix,
+		},
+
+		&ProviderRequirementExprTransformer{
 			Config: b.Config,
-			Walker: b.Walker,
 		},
 
 		&LocalTransformer{
@@ -65,6 +72,8 @@ func (b *InitGraphBuilder) Steps() []GraphTransformer {
 			Keep: func(v dag.Vertex) bool {
 				switch n := v.(type) {
 				case *nodeInstallModule:
+					return true
+				case *nodeResolveProviderRequirements:
 					return true
 				case *NodeRootVariable:
 					return n.Config.Const

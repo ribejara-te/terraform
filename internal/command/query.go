@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/views"
+	"github.com/hashicorp/terraform/internal/policy"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -32,6 +33,11 @@ Usage: terraform [global options] query [options]
 Query Customization Options:
 
   The following options customize how Terraform will run the query.
+
+  -policies=path        Evaluate policies from a policy set directory against
+                        resources discovered by the query. Use this option more
+                        than once to include multiple policy set paths.
+                        The equivalent --policies=path spelling is also supported.
 
   -var 'foo=bar'        Set a value for one of the input variables in the query
                         file of the configuration. Use this option more than
@@ -85,6 +91,25 @@ func (c *QueryCommand) Run(rawArgs []string) int {
 	// diagnostics according to the desired view
 	view := views.NewQuery(args.ViewType, c.View)
 
+	// Log version output
+	view.Version()
+
+	loader, err := c.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
+		view.Diagnostics(diags)
+		return 1
+	}
+
+	// We need to collect variables early in this command to ensure that the
+	// values are available when preparing the backend. A PSS backend will need
+	// the values to resolve the provider requirements.
+	var varDiags tfdiags.Diagnostics
+	c.Meta.VariableValues, varDiags = args.Vars.CollectValues(func(filename string, src []byte) {
+		loader.Parser().ForceFileSource(filename, src)
+	})
+	diags = diags.Append(varDiags)
+
 	if diags.HasErrors() {
 		view.Diagnostics(diags)
 		view.HelpPrompt()
@@ -92,7 +117,6 @@ func (c *QueryCommand) Run(rawArgs []string) int {
 	}
 
 	// Check for user-supplied plugin path
-	var err error
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
 		diags = diags.Append(err)
 		view.Diagnostics(diags)
@@ -126,24 +150,12 @@ func (c *QueryCommand) Run(rawArgs []string) int {
 		return 1
 	}
 
-	if len(args.PolicyPaths) > 0 {
-		client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), args.PolicyPaths, backendPolicyEntitlement(be))
-		// if there has been any errors when setting up the policy client, we log them but
-		// we still proceed with the operation, as a failure to set up the policy client
-		// should not prevent the query operation from running
-		if opReq.View != nil && policyDiags != nil {
-			opReq.View.PolicyDiagnostics(policyDiags)
-		}
-		opReq.PolicyClient = client
-		defer stopClient()
-	}
+	stopPolicyClient := c.configureQueryPolicyClient(be, opReq)
+	defer stopPolicyClient()
 
-	// Collect variable value and add them to the operation request
-	var varDiags tfdiags.Diagnostics
-	opReq.Variables, varDiags = args.Vars.CollectValues(func(filename string, src []byte) {
-		opReq.ConfigLoader.Parser().ForceFileSource(filename, src)
-	})
-	diags = diags.Append(varDiags)
+	// Assign config loader and variables to the operation request
+	opReq.ConfigLoader = loader
+	opReq.Variables = c.Meta.VariableValues
 
 	// Before we delegate to the backend, we'll print any warning diagnostics
 	// we've accumulated here, since the backend will start fresh with its own
@@ -169,9 +181,27 @@ func (c *QueryCommand) Run(rawArgs []string) int {
 	return op.Result.ExitStatus()
 }
 
+func (c *QueryCommand) configureQueryPolicyClient(be backendrun.OperationsBackend, opReq *backendrun.Operation) func() {
+	remote, isRemoteBackend := be.(BackendWithRemoteTerraformVersion)
+	// Remote execution forwards policy paths to the server; only local
+	// execution needs an in-process policy client.
+	if len(opReq.PolicyPaths) == 0 || (isRemoteBackend && !remote.IsLocalOperations()) {
+		return func() {}
+	}
+
+	client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), opReq.PolicyPaths, backendPolicyEntitlement(be, policy.PlanEvaluationStage))
+	if opReq.View != nil && policyDiags != nil {
+		opReq.View.PolicyDiagnostics(policyDiags)
+	}
+	opReq.PolicyClient = client
+	return stopClient
+}
+
 func (c *QueryCommand) Validate(args *arguments.Query) (diags tfdiags.Diagnostics) {
-	// validatePolicyPaths call ejects early if -policies flag was passed for non-experimental builds
-	return diags.Append(validatePolicyPaths(args.PolicyPaths, c.AllowExperimentalFeatures))
+	// The query command's -policies option takes policy set directories, so we
+	// reject anything that isn't a directory here rather than letting it reach
+	// the policy client.
+	return diags.Append(validatePolicySetDirs(args.PolicyPaths))
 }
 
 func (c *QueryCommand) PrepareBackend(args *arguments.State, viewType arguments.ViewType) (backendrun.OperationsBackend, tfdiags.Diagnostics) {
@@ -198,13 +228,6 @@ func (c *QueryCommand) OperationRequest(
 	opReq.View = view.Operation()
 	opReq.Query = true
 	opReq.PolicyPaths = policyPaths
-
-	var err error
-	opReq.ConfigLoader, err = c.initConfigLoader()
-	if err != nil {
-		diags = diags.Append(fmt.Errorf("Failed to initialize config loader: %s", err))
-		return nil, diags
-	}
 
 	return opReq, diags
 }

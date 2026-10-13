@@ -15,8 +15,6 @@ import (
 // NodeApplyableResource nodes into their respective modules.
 type nodeExpandApplyableResource struct {
 	*NodeAbstractResource
-
-	PartialExpansions []addrs.PartialExpandedResource
 }
 
 var (
@@ -55,11 +53,42 @@ func (n *nodeExpandApplyableResource) DynamicExpand(ctx EvalContext) (*Graph, tf
 	expander := ctx.InstanceExpander()
 	moduleInstances := expander.ExpandModule(n.Addr.Module, false)
 	for _, module := range moduleInstances {
+		absAddr := n.Addr.Resource.Absolute(module)
+		// If the resource in this module instance is part of a partial expansion, we will expand it with an unknown count/for_each
+		if n.checkForPartialExpansion(ctx, absAddr) {
+			continue
+		}
+
 		moduleCtx := evalContextForModuleInstance(ctx, module)
-		diags = diags.Append(n.recordResourceData(moduleCtx, n.Addr.Resource.Absolute(module)))
+		diags = diags.Append(n.recordResourceData(moduleCtx, absAddr))
 	}
 
 	return nil, diags
+}
+
+// checkForPartialExpansion reports whether the given resource was deferred
+// during planning because its expansion was unknown. If so, its expansion is
+// recorded as unknown again rather than being evaluated.
+func (n *nodeExpandApplyableResource) checkForPartialExpansion(ctx EvalContext, addr addrs.AbsResource) bool {
+	expander := ctx.InstanceExpander()
+	for _, per := range ctx.Deferrals().PartialExpandedResources(n.Addr) {
+		if per.MatchesResource(addr) {
+			// Resources that are partially expanded shouldn't evaluate count or for_each expressions
+			// as we have already deferred them, so any resulting evaluations were not part of the plan.
+			switch {
+			case n.Config != nil && n.Config.Count != nil:
+				expander.SetResourceCountUnknown(addr.Module, n.Addr.Resource)
+			case n.Config != nil && n.Config.ForEach != nil:
+				expander.SetResourceForEachUnknown(addr.Module, n.Addr.Resource)
+			default:
+				continue
+			}
+
+			return true
+		}
+	}
+
+	return false
 }
 
 // We need to expand the ephemeral resources mostly the same as we do during

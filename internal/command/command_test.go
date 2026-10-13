@@ -53,6 +53,7 @@ import (
 	"github.com/hashicorp/terraform/internal/states/statemgr"
 	"github.com/hashicorp/terraform/internal/terminal"
 	"github.com/hashicorp/terraform/internal/terraform"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -63,8 +64,6 @@ var (
 )
 
 func init() {
-	test = true
-
 	// Initialize the backends
 	backendInit.Init(nil)
 
@@ -140,26 +139,6 @@ func testFixturePath(name string) string {
 	return filepath.Join(fixtureDir, name)
 }
 
-func testPolicyFixtureDir(t *testing.T) string {
-	t.Helper()
-
-	td := t.TempDir()
-	testCopyDir(t, testFixturePath("plan"), td)
-	t.Chdir(td)
-
-	policyCode := `		resource_policy "resource_type" "policy_name" {
-		  enforce_attrs {
-		    key = attr.value == "foo"
-		  }
-		}
-	`
-	if err := os.WriteFile(filepath.Join(td, "policy.hcl"), []byte(policyCode), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	return td
-}
-
 func metaOverridesForProvider(p providers.Interface) *testingOverrides {
 	return &testingOverrides{
 		Providers: map[addrs.Provider]providers.Factory{
@@ -181,7 +160,7 @@ func testModuleWithSnapshot(t *testing.T, name string) (*configs.Config, *config
 	// Test modules usually do not refer to remote sources, and for local
 	// sources only this ultimately just records all of the module paths
 	// in a JSON file so that we can load them below.
-	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), nil)
+	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), testModuleInstallerInitializer(loader))
 	_, instDiags := inst.InstallModules(context.Background(), dir, "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())
@@ -209,6 +188,12 @@ func testModuleWithSnapshot(t *testing.T, name string) (*configs.Config, *config
 	}
 
 	return config, snap
+}
+
+func testModuleInstallerInitializer(loader *configload.Loader) initwd.Initializer {
+	return func(rootMod *configs.Module, walker configs.ModuleWalker) (*configs.Config, tfdiags.Diagnostics) {
+		return terraform.BuildConfigWithGraph(rootMod, walker, nil, configs.MockDataLoaderFunc(loader.LoadExternalMockData))
+	}
 }
 
 // testPlan returns a non-nil noop plan.
@@ -247,102 +232,6 @@ func testPlan(t *testing.T) *plans.Plan {
 
 func testPlanFile(t *testing.T, configSnap *configload.Snapshot, state *states.State, plan *plans.Plan) string {
 	return testPlanFileMatchState(t, configSnap, state, plan, statemgr.SnapshotMeta{})
-}
-
-func TestPlan_PoliciesRequireExperimentalFeatures(t *testing.T) {
-	td := testPolicyFixtureDir(t)
-
-	p := planFixtureProvider()
-	view, done := testView(t)
-	c := &PlanCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			View:             view,
-		},
-	}
-
-	code := c.Run([]string{"-policies", td, "-no-color"})
-	output := done(t)
-	if code != 1 {
-		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
-	}
-	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
-		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
-	}
-	if strings.Contains(output.All(), "Failed to connect to policy engine") {
-		t.Fatalf("policy engine should not be initialized when experiments are disabled: %s", output.All())
-	}
-}
-
-func TestApply_PoliciesRequireExperimentalFeatures(t *testing.T) {
-	td := testPolicyFixtureDir(t)
-
-	p := planFixtureProvider()
-	view, done := testView(t)
-	c := &ApplyCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			View:             view,
-		},
-	}
-
-	code := c.Run([]string{"-policies", td, "-no-color", "-auto-approve"})
-	output := done(t)
-	if code != 1 {
-		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
-	}
-	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
-		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
-	}
-	if strings.Contains(output.All(), "Failed to connect to policy engine") {
-		t.Fatalf("policy engine should not be initialized when experiments are disabled: %s", output.All())
-	}
-}
-
-func TestInit_PoliciesRequireExperimentalFeatures(t *testing.T) {
-	td := testPolicyFixtureDir(t)
-
-	view, done := testView(t)
-	c := &InitCommand{
-		Meta: Meta{
-			Ui:   new(cli.MockUi),
-			View: view,
-		},
-	}
-
-	code := c.Run([]string{"-policies", td, "-no-color"})
-	output := done(t)
-	if code != 1 {
-		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
-	}
-	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
-		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
-	}
-}
-
-func TestQuery_PoliciesRequireExperimentalFeatures(t *testing.T) {
-	td := testPolicyFixtureDir(t)
-
-	p := queryFixtureProvider()
-	view, done := testView(t)
-	c := &QueryCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(p),
-			View:             view,
-		},
-	}
-
-	code := c.Run([]string{"-policies", td, "-no-color"})
-	output := done(t)
-	if code != 1 {
-		t.Fatalf("expected exit code 1, got %d\n\n%s", code, output.All())
-	}
-	if got := output.Stderr(); !strings.Contains(got, "The -policies flag is only valid in experimental builds of Terraform.") {
-		t.Fatalf("expected policy experiment gating diagnostic, got: %s", got)
-	}
-	if strings.Contains(output.All(), "Failed to connect to policy engine") {
-		t.Fatalf("policy engine should not be initialized when experiments are disabled: %s", output.All())
-	}
 }
 
 func testPlanFileMatchState(t *testing.T, configSnap *configload.Snapshot, state *states.State, plan *plans.Plan, stateMeta statemgr.SnapshotMeta) string {
@@ -844,62 +733,59 @@ func testStdoutCapture(t *testing.T, dst io.Writer) func() {
 	}
 }
 
-// testInteractiveInput configures tests so that the answers given are sent
-// in order to interactive prompts. The returned function must be called
-// in a defer to clean up.
-func testInteractiveInput(t *testing.T, answers []string) func() {
+// testInteractiveInput configures a *ui.UIInput for tests so that the answers given are sent
+// in order to interactive prompts.
+// Calling code must use the returned *ui.UIInput when defining the Meta's testOverrides.
+func testInteractiveInput(t *testing.T, answers []string) ui.InputRequesterForTest {
 	t.Helper()
 
-	// Disable test mode so input is called
-	test = false
-
 	// Set up reader/writers
-	testInputResponse = answers
-	defaultInputReader = bytes.NewBufferString("")
-	defaultInputWriter = new(bytes.Buffer)
+	testInputResponse := answers
+	inputReader := bytes.NewBufferString("")
+	inputWriter := new(bytes.Buffer)
 
-	// Return the cleanup
-	return func() {
-		test = true
-		testInputResponse = nil
-	}
+	uiInput := ui.NewUIInputForTests(ui.UIInputOptions{
+		Reader: inputReader,
+		Writer: inputWriter,
+	}, testInputResponse, nil)
+
+	// Return the UIInput for use in the test
+	return uiInput
 }
 
-// testInputMap configures tests so that the given answers are returned
+// testInputMap configures a *ui.UIInput for tests so that the given answers are returned
 // for calls to Input when the right question is asked. The key is the
 // question "Id" that is used.
 //
+// Calling code must use the returned *ui.UIInput when defining the Meta's testOverrides.
 // Calling code can optionally use the returned buffer to make assertions
 // about the prompts shown the to the user.
-func testInputMap(t *testing.T, answers map[string]string) *bytes.Buffer {
+func testInputMap(t *testing.T, answers map[string]string) (ui.InputRequesterForTest, *bytes.Buffer) {
 	t.Helper()
 
-	// Disable test mode so input is called
-	test = false
-
 	// Set up reader/writers
-	defaultInputReader = bytes.NewBufferString("")
+	inputReader := bytes.NewBufferString("")
 	inputWriter := new(bytes.Buffer)
-	defaultInputWriter = inputWriter
 
 	// Setup answers
-	testInputResponse = nil
-	testInputResponseMap = answers
+	var testInputResponse []string
+	var testInputResponseMap map[string]string = answers
+
+	ret := ui.NewUIInputForTests(ui.UIInputOptions{
+		Reader: inputReader,
+		Writer: inputWriter,
+	}, testInputResponse, testInputResponseMap)
 
 	// Queue the cleanup for the end of the test
 	t.Cleanup(func() {
-		unusedAnswers := testInputResponseMap
-
-		// First, clean up!
-		test = true
-		testInputResponseMap = nil
+		unusedAnswers := ret.RemainingTestInputResponses()
 
 		if len(unusedAnswers) > 0 {
 			t.Fatalf("expected no unused answers provided to command.testInputMap, got: %v", unusedAnswers)
 		}
 	})
 
-	return inputWriter
+	return ret, inputWriter
 }
 
 // testBackendState is used to make a test HTTP server to test a configured
@@ -1275,6 +1161,12 @@ func testUiWrapped(t *testing.T, testUi ...*cli.MockUi) *ui.WrappedMockUi {
 	return &ui.WrappedMockUi{MockUi: wrappedMock}
 }
 
+// testView returns a view for a command under test, along with a function
+// that closes the view's streams and returns everything written to them.
+//
+// When running a command within a synctest bubble, the view must be created
+// outside of the bubble. The goroutines capturing the output are blocked on
+// I/O until done is called, so the bubble could otherwise never complete.
 func testView(t *testing.T) (*views.View, func(*testing.T) *terminal.TestOutput) {
 	t.Helper()
 	streams, done := terminal.StreamsForTesting(t)

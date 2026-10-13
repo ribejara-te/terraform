@@ -13,11 +13,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -27,6 +29,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	testing_command "github.com/hashicorp/terraform/internal/command/testing"
 	"github.com/hashicorp/terraform/internal/command/views"
+	viewsJson "github.com/hashicorp/terraform/internal/command/views/json"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configload"
 	"github.com/hashicorp/terraform/internal/getproviders"
@@ -189,8 +192,8 @@ func TestTest_Runs(t *testing.T) {
 		},
 		"no_state": {
 			expectedOut: []string{"0 passed, 1 failed"},
-			expectedErr: []string{"No value for required variable"},
-			description: "the run apply fails, causing it to produce a nil state.",
+			expectedErr: []string{"apply_fail is set to true"},
+			description: "the run apply fails, causing it to produce a nil state. We expect a failure, but no panic",
 			code:        1,
 		},
 		"variables": {
@@ -359,6 +362,12 @@ func TestTest_Runs(t *testing.T) {
 			expectedOut: []string{"2 passed, 0 failed."},
 			code:        0,
 		},
+		"ephemeral_input_optional_unset": {
+			override:    "ephemeral_input",
+			expectedOut: []string{"2 passed, 0 failed."},
+			args:        []string{"-var=foo=\"triple\""},
+			code:        0,
+		},
 		"ephemeral_input_with_error": {
 			expectedOut: []string{"Error message refers to ephemeral values", "1 passed, 1 failed."},
 			expectedErr: []string{"Test assertion failed",
@@ -370,6 +379,14 @@ func TestTest_Runs(t *testing.T) {
 			expectedOut: []string{"0 passed, 1 failed."},
 			expectedErr: []string{"Ephemeral resource instance has expired", "Ephemeral resources cannot be asserted"},
 			code:        1,
+		},
+		"mock_ephemeral_resource": {
+			expectedOut: []string{"1 passed, 0 failed."},
+			code:        0,
+		},
+		"override_ephemeral_resource": {
+			expectedOut: []string{"1 passed, 0 failed."},
+			code:        0,
 		},
 		"with_state_key": {
 			expectedOut: []string{"3 passed, 1 failed."},
@@ -422,6 +439,14 @@ func TestTest_Runs(t *testing.T) {
 		},
 		"ephemeral_output_referenced": {
 			code: 0,
+		},
+		"deprecated_output": {
+			code: 0,
+			expectedOut: []string{
+				"3 passed, 0 failed.",
+				"Deprecated value used",
+				"This output is deprecated!",
+			},
 		},
 		"no-tests": {
 			code: 0,
@@ -602,18 +627,23 @@ func TestTest_Interrupt(t *testing.T) {
 	provider := testing_command.NewProvider(nil)
 	view, done := testView(t)
 
-	interrupt := make(chan struct{})
-	provider.Interrupt = interrupt
+	// The interrupt channel must be created within the bubble, otherwise the
+	// command blocking on ShutdownCh is not durably blocked and the fake clock
+	// can never advance past the provider's sleep.
+	synctest.Test(t, func(t *testing.T) {
+		interrupt := make(chan struct{})
+		provider.Interrupt = interrupt
 
-	c := &TestCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(provider.Provider),
-			View:             view,
-			ShutdownCh:       interrupt,
-		},
-	}
+		c := &TestCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(provider.Provider),
+				View:             view,
+				ShutdownCh:       interrupt,
+			},
+		}
 
-	c.Run(nil)
+		c.Run(nil)
+	})
 	output := done(t).All()
 
 	if !strings.Contains(output, "Interrupt received") {
@@ -923,7 +953,7 @@ Success!
 		}
 	})
 
-	t.Run("cleanup failed state only (-repair)", func(t *testing.T) {
+	t.Run("cleanup failed state only: -repair", func(t *testing.T) {
 		provider := testing_command.NewProvider(nil)
 		providerSource := newMockProviderSource(t, map[string][]string{
 			"test": {"1.0.0"},
@@ -1537,7 +1567,82 @@ func TestTest_ParallelTeardown(t *testing.T) {
 			},
 		},
 		{
-			name: "possible cyclic state key reference: skip edge that would cause cycle",
+			name: "transitive reference prevents parallel teardown",
+			sources: map[string]string{
+				"main.tf": `
+					variable "input" {
+						type = string
+					}
+
+					resource "test_resource" "foo" {
+						value = var.input
+						destroy_wait_seconds = 5
+					}
+
+					output "value" {
+						value = test_resource.foo.value
+					}
+					`,
+				"parallel.tftest.hcl": `
+					test {
+						parallel = true
+					}
+
+					variables {
+						foo = run.test_a.value
+					}
+
+					provider "test" {
+					}
+
+					provider "test" {
+						alias = "start"
+					}
+
+					run "test_a" {
+						state_key = "state_foo"
+						variables {
+							input = "foo"
+						}
+						providers = {
+							test = test
+						}
+
+						assert {
+							condition     = output.value == "foo"
+							error_message = "error in test_a"
+						}
+					}
+
+					run "test_b" {
+						state_key = "state_bar"
+						variables {
+							input = "bar"
+						}
+
+						providers = {
+							test = test.start
+						}
+
+						assert {
+							condition     = output.value != var.foo
+							error_message = "error in test_b"
+						}
+					}
+					`,
+			},
+			assertFunc: func(t *testing.T, output string, dur time.Duration) {
+				if !strings.Contains(output, "2 passed, 0 failed") {
+					t.Errorf("output didn't produce the right output:\n\n%s", output)
+				}
+				// Each teardown sleeps for 5 seconds, so we expect the total duration to be at least 10 seconds.
+				if dur < 10*time.Second {
+					t.Fatalf("parallel.tftest.hcl duration took too short: %0.2f seconds", dur.Seconds())
+				}
+			},
+		},
+		{
+			name: "cyclic state key reference",
 			sources: map[string]string{
 				"main.tf": `
 					variable "foo" {
@@ -1546,14 +1651,22 @@ func TestTest_ParallelTeardown(t *testing.T) {
 
 					resource "test_resource" "foo" {
 						value = var.foo
-						// destroy_wait_seconds = 5
 					}
 
 					output "value" {
 						value = test_resource.foo.value
 					}
 					`,
-				// c2 => a1, b1 => a1, a2 => b1, b2 => c1
+				/*
+
+					 a2   b2       c2
+					| \   /  \  /  /
+					|   b1   c1   /
+					|   |        /
+					|   |       /
+					|   |      /
+					     a1
+				*/
 				"parallel.tftest.hcl": `
 					test {
 						parallel = true
@@ -1636,24 +1749,9 @@ func TestTest_ParallelTeardown(t *testing.T) {
 					t.Errorf("output didn't produce the right output:\n\n%s", output)
 				}
 
-				lines := strings.Split(output, "\n")
-				aIdx, bIdx, cIdx := -1, -1, -1
-				for idx, line := range lines {
-					if strings.Contains(line, "tearing down") {
-						if strings.Contains(line, "a2") {
-							aIdx = idx
-						}
-						if strings.Contains(line, "b2") {
-							bIdx = idx
-						}
-						if strings.Contains(line, "c2") {
-							cIdx = idx
-						}
-					}
-				}
-
-				if cIdx > aIdx || aIdx > bIdx { // c => a => b
-					t.Errorf("teardown order is incorrect: c2 (%d), a2 (%d), b2 (%d)", cIdx, aIdx, bIdx)
+				// Each teardown sleeps for 3 seconds, so we expect the total duration to be less than 9 seconds.
+				if dur >= 9*time.Second {
+					t.Fatalf("parallel.tftest.hcl duration took too long: %0.2f seconds", dur.Seconds())
 				}
 			},
 		},
@@ -1664,13 +1762,14 @@ func TestTest_ParallelTeardown(t *testing.T) {
 			_, td, closer := testModuleInline(t, tt.sources)
 			defer closer()
 			t.Chdir(td)
+			initStreams, initDone := terminal.StreamsForTesting(t)
+			testStreams, testDone := terminal.StreamsForTesting(t)
 
 			providerSource := newMockProviderSource(t, map[string][]string{
 				"test": {"1.0.0"},
 			})
 
-			streams, done := terminal.StreamsForTesting(t)
-			view := views.NewView(streams)
+			view := views.NewView(initStreams)
 			ui := testUiWrapped(t)
 
 			// create a new provider instance for each test run, so that we can
@@ -1687,19 +1786,24 @@ func TestTest_ParallelTeardown(t *testing.T) {
 					}},
 				Ui:             ui,
 				View:           view,
-				Streams:        streams,
+				Streams:        initStreams,
 				ProviderSource: providerSource,
 			}
 
 			init := &InitCommand{Meta: meta}
 			if code := init.Run(nil); code != 0 {
-				output := done(t)
+				output := initDone(t)
 				t.Fatalf("expected status code %d but got %d: %s", 0, code, output.All())
 			}
 
+			meta.Streams = testStreams
+			view = views.NewView(testStreams)
+			meta.View = view
 			c := &TestCommand{Meta: meta}
-			c.Run([]string{"-json", "-no-color"})
-			output := done(t).All()
+			synctest.Test(t, func(t *testing.T) {
+				c.Run([]string{"-json", "-no-color"})
+			})
+			output := testDone(t).All()
 
 			// Split the log into lines
 			lines := strings.Split(output, "\n")
@@ -1752,18 +1856,22 @@ func TestTest_InterruptSkipsRemaining(t *testing.T) {
 	provider := testing_command.NewProvider(nil)
 	view, done := testView(t)
 
-	interrupt := make(chan struct{})
-	provider.Interrupt = interrupt
+	// The interrupt channel must be created within the bubble, so that the
+	// command blocking on ShutdownCh is durably blocked.
+	synctest.Test(t, func(t *testing.T) {
+		interrupt := make(chan struct{})
+		provider.Interrupt = interrupt
 
-	c := &TestCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(provider.Provider),
-			View:             view,
-			ShutdownCh:       interrupt,
-		},
-	}
+		c := &TestCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(provider.Provider),
+				View:             view,
+				ShutdownCh:       interrupt,
+			},
+		}
 
-	c.Run([]string{"-no-color"})
+		c.Run([]string{"-no-color"})
+	})
 	output := done(t).All()
 
 	if !strings.Contains(output, "skip_me.tftest.hcl... skip") {
@@ -1784,18 +1892,22 @@ func TestTest_DoubleInterrupt(t *testing.T) {
 	provider := testing_command.NewProvider(nil)
 	view, done := testView(t)
 
-	interrupt := make(chan struct{})
-	provider.Interrupt = interrupt
+	// The interrupt channel must be created within the bubble, so that the
+	// command blocking on ShutdownCh is durably blocked.
+	synctest.Test(t, func(t *testing.T) {
+		interrupt := make(chan struct{})
+		provider.Interrupt = interrupt
 
-	c := &TestCommand{
-		Meta: Meta{
-			testingOverrides: metaOverridesForProvider(provider.Provider),
-			View:             view,
-			ShutdownCh:       interrupt,
-		},
-	}
+		c := &TestCommand{
+			Meta: Meta{
+				testingOverrides: metaOverridesForProvider(provider.Provider),
+				View:             view,
+				ShutdownCh:       interrupt,
+			},
+		}
 
-	c.Run(nil)
+		c.Run(nil)
+	})
 	output := done(t).All()
 
 	if !strings.Contains(output, "Two interrupts received") {
@@ -4613,13 +4725,15 @@ func TestTest_LongRunningTest(t *testing.T) {
 		},
 	}
 
-	code := c.Run([]string{"-no-color"})
+	var code int
+	synctest.Test(t, func(t *testing.T) {
+		code = c.Run([]string{"-no-color"})
+	})
 	output := done(t)
 
 	if code != 0 {
 		t.Errorf("expected status code 0 but got %d", code)
 	}
-
 	actual := output.All()
 	expected := `main.tftest.hcl... in progress
   run "test"... pass
@@ -4638,8 +4752,8 @@ Success! 1 passed, 0 failed.
 	}
 }
 
-// This test takes around 10 seconds to complete, as we're testing the progress
-// updates that are printed every 2 seconds. Sorry!
+// This test covers the progress updates that are printed every 2 seconds. The
+// command runs within a synctest bubble, so the waits use a fake clock.
 func TestTest_LongRunningTestJSON(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(path.Join("test", "long_running")), td)
@@ -4655,7 +4769,10 @@ func TestTest_LongRunningTestJSON(t *testing.T) {
 		},
 	}
 
-	code := c.Run([]string{"-json"})
+	var code int
+	synctest.Test(t, func(t *testing.T) {
+		code = c.Run([]string{"-json"})
+	})
 	output := done(t)
 
 	if code != 0 {
@@ -5156,6 +5273,7 @@ test_resource_id = %s`, resourceId, resourceId)
 				"write_only":           cty.NullVal(cty.String),
 				"create_wait_seconds":  cty.NullVal(cty.Number),
 				"destroy_fail":         cty.False,
+				"apply_fail":           cty.False,
 				"destroy_wait_seconds": cty.NullVal(cty.Number),
 				"defer":                cty.NullVal(cty.Bool),
 			})},
@@ -5954,6 +6072,255 @@ func TestTest_TeardownOrder(t *testing.T) {
 	}
 }
 
+func TestTest_ParallelDeps(t *testing.T) {
+	// These are sets of tests asserting that parallel dependencies are handled correctly during teardown.
+	runInitCommand := func() (Meta, *testing_command.TestProvider) {
+		provider := testing_command.NewProvider(nil)
+		providerSource := newMockProviderSource(t, map[string][]string{
+			"test": {"1.0.0"},
+		})
+
+		streams, done := terminal.StreamsForTesting(t)
+		view := views.NewView(streams)
+		ui := testUiWrapped(t)
+
+		meta := Meta{
+			testingOverrides:          metaOverridesForProvider(provider.Provider),
+			Ui:                        ui,
+			View:                      view,
+			Streams:                   streams,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		}
+
+		init := &InitCommand{
+			Meta: meta,
+		}
+
+		if code := init.Run(nil); code != 0 {
+			output := done(t)
+			t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+		}
+
+		return meta, provider
+	}
+
+	// helper to parse a single line of test output, returning the teardown run name if it matches
+	parseTeardownLine := func(line jsonLine) string {
+		if line.Type != "test_run" || line.TestRun == nil {
+			return ""
+		}
+		if line.TestRun.Progress != "teardown" {
+			return ""
+		}
+
+		// We only care about teardowns with elapsed time of 0, indicating the start
+		// of the teardown phase.
+		if line.TestRun.Elapsed == nil || *line.TestRun.Elapsed != 0 {
+			return ""
+		}
+		return line.TestRun.Run
+	}
+
+	/*
+
+			       1A
+					|
+					3
+				  /   \
+				 2     1B
+
+		1A and 1B have the same state key, so during teardown, they are only
+		represented by a single node in the graph. We have to take care not to
+		build a cyclic reference in the teardown graph.
+		We do that by resolving the first reference (1B) encountered in the reverse topological
+		order. Following that reference, we mark the state 1 as visited so that
+		we do not visit it again when we encounter it elsewhere (1A)
+	*/
+	t.Run("potential cyclic reference via state dependency", func(t *testing.T) {
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath(path.Join("test", "parallel_deps")), td)
+		t.Chdir(td)
+		meta, provider := runInitCommand()
+
+		// Reset the streams for the next command.
+		streams, done := terminal.StreamsForTesting(t)
+		meta.Streams = streams
+		meta.View = views.NewView(streams)
+
+		c := &TestCommand{
+			Meta: meta,
+		}
+
+		code := c.Run([]string{"-no-color", "-json"})
+		output := done(t)
+
+		if code != 0 {
+			t.Errorf("expected status code 0 but got %d", code)
+		}
+
+		actual := output.All()
+
+		var teardownOrder []string
+		lines, err := parseJSONLines(t, actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, parsed := range lines {
+			if run := parseTeardownLine(parsed); run != "" {
+				teardownOrder = append(teardownOrder, run)
+			}
+		}
+
+		if len(teardownOrder) != 3 {
+			t.Errorf("expected 3 teardown runs but got %d", len(teardownOrder))
+		}
+
+		if teardownOrder[2] != "test_three" {
+			t.Errorf("expected test_three to be the third teardown run but got %v", teardownOrder)
+		}
+
+		if provider.ResourceCount() != 0 {
+			t.Errorf("should have deleted all resources: got %v", provider.Resources())
+		}
+	})
+
+	/*
+
+			       1A (SkipCleanup=true)
+					|
+					3
+				  /   \
+				 2     1B
+
+		1A and 1B have the same state key, so during teardown, they are only
+		represented by a single node in the graph. We have to take care not to
+		build a cyclic reference in the teardown graph.
+		1B is the most recent run in the graph for state 1,
+		but skip_cleanup=true on 1A means 1A owns the cleanup node,
+		and so we have to resolve state 1 through 1A.
+	*/
+	t.Run("skip_cleanup=true on first run owns cleanup node", func(t *testing.T) {
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath(path.Join("test", "parallel_deps", "with_skip_cleanup")), td)
+		t.Chdir(td)
+		meta, _ := runInitCommand()
+
+		// Reset the streams for the next command.
+		streams, done := terminal.StreamsForTesting(t)
+		meta.Streams = streams
+		meta.View = views.NewView(streams)
+
+		c := &TestCommand{
+			Meta: meta,
+		}
+
+		code := c.Run([]string{"-no-color", "-json"})
+		output := done(t)
+
+		if code != 0 {
+			t.Errorf("expected status code 0 but got %d", code)
+		}
+
+		actual := output.All()
+
+		var teardownOrder []string
+		lines, err := parseJSONLines(t, actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, parsed := range lines {
+			if run := parseTeardownLine(parsed); run != "" {
+				teardownOrder = append(teardownOrder, run)
+			}
+		}
+
+		expected := []string{"test_two", "test_three", "test_one_a"}
+		if !reflect.DeepEqual(teardownOrder, expected) {
+			t.Errorf("expected teardown order %v but got %v", expected, teardownOrder)
+		}
+	})
+
+	/*
+					D
+				  /   \
+			 	 A     B
+				  \   /
+				    C
+
+		What matters here is that A and B are between C and D.
+		A and B are siblings, so they can be planned and torn down in parallel.
+	*/
+	t.Run("diamond graph with sibling dependencies", func(t *testing.T) {
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath(path.Join("test", "parallel_deps", "diamond")), td)
+		t.Chdir(td)
+		meta, provider := runInitCommand()
+
+		// Reset the streams for the next command.
+		streams, done := terminal.StreamsForTesting(t)
+		meta.Streams = streams
+		meta.View = views.NewView(streams)
+
+		c := &TestCommand{
+			Meta: meta,
+		}
+
+		code := c.Run([]string{"-no-color", "-json"})
+		output := done(t)
+
+		if code != 0 {
+			t.Errorf("expected status code 0 but got %d", code)
+		}
+
+		actual := output.All()
+
+		var teardownOrder []string
+		lines, err := parseJSONLines(t, actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, parsed := range lines {
+			if run := parseTeardownLine(parsed); run != "" {
+				teardownOrder = append(teardownOrder, run)
+			}
+		}
+
+		if len(teardownOrder) != 4 {
+			t.Errorf("expected 4 teardown runs but got %d", len(teardownOrder))
+		}
+
+		if teardownOrder[0] != "state_c" && teardownOrder[len(teardownOrder)-1] != "state_d" {
+			t.Errorf("expected state_c and state_d to be the first and last teardown runs but got %v", teardownOrder)
+		}
+
+		if provider.ResourceCount() != 0 {
+			t.Errorf("should have deleted all resources: got %v", provider.Resources())
+		}
+	})
+}
+
+type jsonLine struct {
+	Type    string                   `json:"type"`
+	TestRun *viewsJson.TestRunStatus `json:"test_run,omitempty"`
+}
+
+func parseJSONLines(t *testing.T, actual string) ([]jsonLine, error) {
+	t.Helper()
+	var lines []jsonLine
+	for line := range strings.SplitSeq(strings.TrimSpace(actual), "\n") {
+		if line == "" {
+			continue
+		}
+		var parsed jsonLine
+		if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+			return nil, err
+		}
+		lines = append(lines, parsed)
+	}
+	return lines, nil
+}
+
 // testModuleInline takes a map of path -> config strings and yields a config
 // structure with those files loaded from disk
 func testModuleInline(t *testing.T, sources map[string]string) (*configs.Config, string, func()) {
@@ -5987,7 +6354,7 @@ func testModuleInline(t *testing.T, sources map[string]string) (*configs.Config,
 	// Test modules usually do not refer to remote sources, and for local
 	// sources only this ultimately just records all of the module paths
 	// in a JSON file so that we can load them below.
-	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), nil)
+	inst := initwd.NewModuleInstaller(loader.ModulesDir(), loader, registry.NewClient(nil, nil), testModuleInstallerInitializer(loader))
 	_, instDiags := inst.InstallModules(context.Background(), cfgPath, "tests", true, false)
 	if instDiags.HasErrors() {
 		t.Fatal(instDiags.Err())

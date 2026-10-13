@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
@@ -16,7 +18,6 @@ import (
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // ConcreteResourceNodeFunc is a callback type used to convert an
@@ -72,7 +73,7 @@ type NodeAbstractResource struct {
 	ProvisionerSchemas map[string]*configschema.Block
 
 	// Set from GraphNodeTargetable
-	Targets []addrs.Targetable
+	Targets []addrs.TargetPattern
 
 	// Set from AttachDataResourceDependsOn
 	dependsOn []addrs.ConfigResource
@@ -364,16 +365,18 @@ func (n *NodeAbstractResource) Provider() ProviderRef {
 		// The import targets should either all be defined via config or none
 		// of them should be. They should also all have the same provider, so it
 		// shouldn't matter which we check here, as they'll all give the same.
-		if n.importTargets[0].Config != nil && n.importTargets[0].Config.ProviderConfigRef != nil {
+		if n.importTargets[0].Config != nil {
+			imp := n.importTargets[0].Config
 			ref := ProviderRef{
 				Addr: addrs.AbsProviderConfig{
-					Provider: n.importTargets[0].Config.Provider,
-					Alias:    n.importTargets[0].Config.ProviderConfigRef.Alias,
+					Provider: imp.Provider,
 					Module:   n.ModulePath(),
 				},
 			}
 
-			ref.Addr.Alias = n.importTargets[0].Config.ProviderConfigRef.Alias
+			if imp.ProviderConfigRef != nil {
+				ref.Addr.Alias = imp.ProviderConfigRef.Alias
+			}
 			return ref
 		}
 	}
@@ -449,7 +452,7 @@ func (n *NodeAbstractResource) ResourceAddr() addrs.ConfigResource {
 }
 
 // GraphNodeTargetable
-func (n *NodeAbstractResource) SetTargets(targets []addrs.Targetable) {
+func (n *NodeAbstractResource) SetTargets(targets []addrs.TargetPattern) {
 	n.Targets = targets
 }
 
@@ -550,12 +553,12 @@ func (n *NodeAbstractResource) recordResourceData(ctx EvalContext, addr addrs.Ab
 
 // readResourceInstanceState reads the current object for a specific instance in
 // the state.
-func (n *NodeAbstractResource) readResourceInstanceState(ctx EvalContext, addr addrs.AbsResourceInstance) (*states.ResourceInstanceObject, tfdiags.Diagnostics) {
+func (n *NodeAbstractResource) readResourceInstanceState(ctx EvalContext, addr addrs.AbsResourceInstance) (*states.ResourceInstanceObject, bool, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	provider, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
 	if err != nil {
 		diags = diags.Append(err)
-		return nil, diags
+		return nil, false, diags
 	}
 
 	log.Printf("[TRACE] readResourceInstanceState: reading state for %s", addr)
@@ -564,27 +567,27 @@ func (n *NodeAbstractResource) readResourceInstanceState(ctx EvalContext, addr a
 	if src == nil {
 		// Presumably we only have deposed objects, then.
 		log.Printf("[TRACE] readResourceInstanceState: no state present for %s", addr)
-		return nil, nil
+		return nil, false, nil
 	}
 
 	schema := providerSchema.SchemaForResourceAddr(addr.Resource.ContainingResource())
 	if schema.Body == nil {
 		// Shouldn't happen since we should've failed long ago if no schema is present
-		return nil, diags.Append(fmt.Errorf("no schema available for %s while reading state; this is a bug in Terraform and should be reported", addr))
+		return nil, false, diags.Append(fmt.Errorf("no schema available for %s while reading state; this is a bug in Terraform and should be reported", addr))
 	}
-	src, upgradeDiags := upgradeResourceState(addr, provider, src, schema)
+	src, stateSchemaUpgraded, upgradeDiags := upgradeResourceState(addr, provider, src, schema)
 	if n.Config != nil {
 		upgradeDiags = upgradeDiags.InConfigBody(n.Config.Config, addr.String())
 	}
 	diags = diags.Append(upgradeDiags)
 	if diags.HasErrors() {
-		return nil, diags
+		return nil, false, diags
 	}
 
-	src, upgradeDiags = upgradeResourceIdentity(addr, provider, src, schema)
+	src, identityUpgraded, upgradeDiags := upgradeResourceIdentity(addr, provider, src, schema)
 	diags = diags.Append(upgradeDiags)
 	if diags.HasErrors() {
-		return nil, diags
+		return nil, false, diags
 	}
 
 	obj, err := src.Decode(schema)
@@ -592,7 +595,7 @@ func (n *NodeAbstractResource) readResourceInstanceState(ctx EvalContext, addr a
 		diags = diags.Append(err)
 	}
 
-	return obj, diags
+	return obj, stateSchemaUpgraded || identityUpgraded, diags
 }
 
 // readResourceInstanceStateDeposed reads the deposed object for a specific
@@ -625,7 +628,7 @@ func (n *NodeAbstractResource) readResourceInstanceStateDeposed(ctx EvalContext,
 
 	}
 
-	src, upgradeDiags := upgradeResourceState(addr, provider, src, schema)
+	src, _, upgradeDiags := upgradeResourceState(addr, provider, src, schema)
 	if n.Config != nil {
 		upgradeDiags = upgradeDiags.InConfigBody(n.Config.Config, addr.String())
 	}
@@ -638,7 +641,7 @@ func (n *NodeAbstractResource) readResourceInstanceStateDeposed(ctx EvalContext,
 		return nil, diags
 	}
 
-	src, upgradeDiags = upgradeResourceIdentity(addr, provider, src, schema)
+	src, _, upgradeDiags = upgradeResourceIdentity(addr, provider, src, schema)
 	diags = diags.Append(upgradeDiags)
 	if diags.HasErrors() {
 		return nil, diags

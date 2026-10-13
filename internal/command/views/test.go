@@ -31,6 +31,8 @@ import (
 
 // Test renders outputs for test executions.
 type Test interface {
+	JSONOutputVersionLogger
+
 	// Abstract should print an early summary of the tests that will be
 	// executed. This will be called before the tests have been executed so
 	// the status for everything within suite will be test.Pending.
@@ -103,6 +105,8 @@ type TestHuman struct {
 }
 
 var _ Test = (*TestHuman)(nil)
+
+func (t *TestHuman) Version() {}
 
 func (t *TestHuman) Abstract(_ *moduletest.Suite) {
 	// Do nothing, we don't print an abstract for the human view.
@@ -212,7 +216,7 @@ func (t *TestHuman) Run(run *moduletest.Run, file *moduletest.File, progress mod
 			}
 		} else {
 			// We'll print the plan.
-			outputs, changed, drift, attrs, actions, err := jsonplan.MarshalForRenderer(run.Verbose.Plan, schemas)
+			jsonPlan, err := jsonplan.MarshalForRenderer(run.Verbose.Plan, schemas)
 			if err != nil {
 				run.Diagnostics = run.Diagnostics.Append(tfdiags.Sourceless(
 					tfdiags.Warning,
@@ -222,12 +226,13 @@ func (t *TestHuman) Run(run *moduletest.Run, file *moduletest.File, progress mod
 				plan := jsonformat.Plan{
 					PlanFormatVersion:     jsonplan.FormatVersion,
 					ProviderFormatVersion: jsonprovider.FormatVersion,
-					OutputChanges:         outputs,
-					ResourceChanges:       changed,
-					ResourceDrift:         drift,
+					OutputChanges:         jsonPlan.OutputChanges,
+					ResourceChanges:       jsonPlan.ResourceChanges,
+					ResourceDrift:         jsonPlan.ResourceDrift,
 					ProviderSchemas:       jsonprovider.MarshalForRenderer(schemas),
-					RelevantAttributes:    attrs,
-					ActionInvocations:     actions,
+					RelevantAttributes:    jsonPlan.RelevantAttributes,
+					ActionInvocations:     jsonPlan.ActionInvocations,
+					DeferredChanges:       jsonPlan.DeferredChanges,
 				}
 
 				var opts []plans.Quality
@@ -392,6 +397,10 @@ type TestJSON struct {
 }
 
 var _ Test = (*TestJSON)(nil)
+
+func (t *TestJSON) Version() {
+	t.view.Version()
+}
 
 func (t *TestJSON) Abstract(suite *moduletest.Suite) {
 	var fileCount, runCount int
@@ -590,7 +599,7 @@ func (t *TestJSON) Run(run *moduletest.Run, file *moduletest.File, progress modu
 					"@testrun", run.Name)
 			}
 		} else {
-			outputs, changed, drift, attrs, actions, err := jsonplan.MarshalForRenderer(run.Verbose.Plan, schemas)
+			jsonPlan, err := jsonplan.MarshalForRenderer(run.Verbose.Plan, schemas)
 			if err != nil {
 				run.Diagnostics = run.Diagnostics.Append(tfdiags.Sourceless(
 					tfdiags.Warning,
@@ -600,12 +609,13 @@ func (t *TestJSON) Run(run *moduletest.Run, file *moduletest.File, progress modu
 				plan := jsonformat.Plan{
 					PlanFormatVersion:     jsonplan.FormatVersion,
 					ProviderFormatVersion: jsonprovider.FormatVersion,
-					OutputChanges:         outputs,
-					ResourceChanges:       changed,
-					ResourceDrift:         drift,
+					OutputChanges:         jsonPlan.OutputChanges,
+					ResourceChanges:       jsonPlan.ResourceChanges,
+					ResourceDrift:         jsonPlan.ResourceDrift,
 					ProviderSchemas:       jsonprovider.MarshalForRenderer(schemas),
-					RelevantAttributes:    attrs,
-					ActionInvocations:     actions,
+					RelevantAttributes:    jsonPlan.RelevantAttributes,
+					ActionInvocations:     jsonPlan.ActionInvocations,
+					DeferredChanges:       jsonPlan.DeferredChanges,
 				}
 
 				t.view.log.Info(

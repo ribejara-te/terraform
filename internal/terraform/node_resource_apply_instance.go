@@ -108,6 +108,7 @@ func (n *NodeApplyableResourceInstance) ephemeralResourceExecute(ctx EvalContext
 		addr:           n.Addr,
 		config:         n.Config,
 		providerConfig: n.ResolvedProvider,
+		override:       n.override,
 	})
 
 	return diags
@@ -192,7 +193,8 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 
 	destroy := (diffApply.Action == plans.Delete || diffApply.Action.IsReplace())
 	// Get the stored action for CBD if we have a plan already
-	createBeforeDestroyEnabled = diffApply.Change.Action == plans.CreateThenDelete
+	createBeforeDestroyEnabled = diffApply.Change.Action == plans.CreateThenDelete ||
+		diffApply.Change.Action == plans.CreateThenForget
 
 	if destroy && n.CreateBeforeDestroy() {
 		createBeforeDestroyEnabled = true
@@ -209,7 +211,7 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		log.Printf("[TRACE] managedResourceExecute: prior object for %s now deposed with key %s", n.Addr, deposedKey)
 	}
 
-	state, readDiags := n.readResourceInstanceState(ctx, n.ResourceInstanceAddr())
+	state, _, readDiags := n.readResourceInstanceState(ctx, n.ResourceInstanceAddr())
 	diags = diags.Append(readDiags)
 	if diags.HasErrors() {
 		return diags
@@ -229,7 +231,7 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 
 	// Make a new diff, in case we've learned new values in the state
 	// during apply which we can now incorporate.
-	diffApply, _, deferred, planDiags := n.plan(ctx, diff, state, false, n.forceReplace, repData)
+	diffApply, _, deferred, planDiags := n.plan(ctx, diff, state, false, n.forceReplace, repData, false)
 	diags = diags.Append(planDiags)
 	if diags.HasErrors() {
 		return diags
@@ -288,7 +290,7 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 	diags = diags.Append(applyDiags)
 	if diags.HasErrors() {
 		// apply errors might need to taint the state
-		if err := n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
+		if state, err = n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
 			return diags.Append(err)
 		}
 	} else {
@@ -321,7 +323,7 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		diags = diags.Append(applyProvisionersDiags)
 		// provisioners always tainted on error
 		if diags.HasErrors() {
-			if err := n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
+			if state, err = n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
 				// we always return immediately if we can't update state
 				return diags.Append(err)
 			}
@@ -332,7 +334,7 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx EvalContext) 
 		taintInstance, actionDiags := n.invokeActions(ctx, repData, configs.AfterEvents, state.Value)
 		diags = diags.Append(actionDiags)
 		if taintInstance {
-			if err := n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
+			if state, err = n.taintInstanceState(ctx, state, diffApply.Action); err != nil {
 				// we always return immediately if we can't update state
 				return diags.Append(err)
 			}
@@ -467,18 +469,20 @@ func (n *NodeApplyableResourceInstance) checkPlannedChange(ctx EvalContext, plan
 
 // taintInstanceState takes the state object error from an apply operation and
 // writes the instance object to the global stated marked as tainted, but only
-// if the instance was being created.
+// if the instance was being created. The returned object is what was written,
+// and must replace the caller's object so that later writes of it do not
+// revert the tainted status.
 //
 // TODO: Tainted was invented for failed create events, and provisioners which
 // could only be associated with those create events. If actions ever need to be
 // rerun for other event types, something more specific than `Tainted` needs to
 // be added to the resource state.
-func (n *NodeApplyableResourceInstance) taintInstanceState(ctx EvalContext, state *states.ResourceInstanceObject, action plans.Action) error {
+func (n *NodeApplyableResourceInstance) taintInstanceState(ctx EvalContext, state *states.ResourceInstanceObject, action plans.Action) (*states.ResourceInstanceObject, error) {
 	if action != plans.Create {
-		return nil
+		return state, nil
 	}
 
 	log.Printf("[TRACE] taintState: %s encountered an error during creation, so it is now marked as tainted", n.Addr)
-	return n.writeResourceInstanceState(ctx, state.AsTainted(), workingState)
-
+	tainted := state.AsTainted()
+	return tainted, n.writeResourceInstanceState(ctx, tainted, workingState)
 }

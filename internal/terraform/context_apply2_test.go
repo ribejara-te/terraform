@@ -30,7 +30,9 @@ import (
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
+	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/states/statefile"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -689,7 +691,7 @@ resource "test_object" "s" {
 	// destroy only a single instance not included in the moved statements
 	_, diags = ctx.Plan(m, state, &PlanOpts{
 		Mode:    plans.DestroyMode,
-		Targets: []addrs.Targetable{mustResourceInstanceAddr(`module.modb["a"].test_object.a`)},
+		Targets: []addrs.TargetPattern{mustTargetPattern(`module.modb["a"].test_object.a`)},
 	})
 	tfdiags.AssertNoErrors(t, diags)
 }
@@ -5123,7 +5125,7 @@ resource test_object default {}
 	t.Run("targeted destroy", func(t *testing.T) {
 		p.ApplyResourceChangeCalled = false //reset!
 		state := testState()
-		plan, diags := ctx.Plan(m, state, &PlanOpts{Mode: plans.DestroyMode, Targets: []addrs.Targetable{forget}})
+		plan, diags := ctx.Plan(m, state, &PlanOpts{Mode: plans.DestroyMode, Targets: []addrs.TargetPattern{mustTargetPattern(forget.String())}})
 		if len(diags) != 2 { // usual -target diag + warning about forgetting
 			t.Fatalf("wrong number of diagnostics. Got %d, expected %d\n", len(diags), 2)
 		}
@@ -5197,7 +5199,7 @@ resource test_object default {}
 		if !strings.Contains(diags.ErrWithWarnings().Error(), "Some objects will no longer be managed by Terraform") {
 			t.Fatal("missing expected diagnostic")
 		}
-		assertPlan(t, plan, forget, plans.CreateThenForget)
+		assertPlan(t, plan, forget, plans.ForgetThenCreate)
 
 		state, applyDiags := ctx.Apply(plan, m, nil)
 		assertNoDiagnostics(t, applyDiags)
@@ -5283,5 +5285,558 @@ resource "test_object" "forget_too" {
 	assertNoDiagnostics(t, applyDiags)
 	if !state.Empty() {
 		t.Fatal("unexpected resources in state")
+	}
+}
+
+// the addition of the CBD resource should not interfere with the existing resource replacement
+func TestContext2Apply_replaceWithAddedCBD(t *testing.T) {
+	t.Run("example1", func(t *testing.T) {
+		state := states.BuildState(func(s *states.SyncState) {
+			s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.r3"), &states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"test_string":"old_r3"}`),
+				Status:    states.ObjectTainted,
+			}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+		})
+
+		m := testModuleInline(t, map[string]string{
+			"main.tf": `
+resource "test_object" "r1" {}
+
+resource "test_object" "r2" {
+  lifecycle { create_before_destroy = true }
+  depends_on = [test_object.r1]
+}
+
+resource "test_object" "r3" {
+  test_string = test_object.r1.test_string
+}
+`})
+
+		p := simpleMockProvider()
+		oldR3destroyed := false
+
+		p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+			// we need to check for the destroy request for the old r3 instance
+			if !req.PriorState.IsNull() {
+				if arg := req.PriorState.GetAttr("test_string"); !arg.IsNull() && arg.AsString() == "old_r3" && req.PlannedState.IsNull() {
+					oldR3destroyed = true
+				}
+
+			}
+			resp.NewState = req.PlannedState
+			return resp
+		}
+
+		hook := new(MockHook)
+		ctx := testContext2(t, &ContextOpts{
+			Hooks: []Hook{hook},
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+			},
+		})
+
+		plan, diags := ctx.Plan(m, state, &PlanOpts{Mode: plans.NormalMode})
+		if assertNoDiagnostics(t, diags) {
+			t.Fatal(diags.ErrWithWarnings())
+		}
+
+		for _, ch := range plan.Changes.Resources {
+			if ch.Addr.Equal(mustResourceInstanceAddr("test_object.r3")) && ch.Action != plans.DeleteThenCreate {
+				t.Fatal("wrong change for r3:", ch.Action, ch.ActionReason)
+			}
+		}
+
+		_, applyDiags := ctx.Apply(plan, m, nil)
+		assertNoDiagnostics(t, applyDiags)
+
+		if !oldR3destroyed {
+			t.Fatal("the original r3 was not destroyed")
+		}
+	})
+
+	t.Run("example2", func(t *testing.T) {
+		state := states.BuildState(func(s *states.SyncState) {
+			s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.r2"), &states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"test_string":"r2"}`),
+				Status:    states.ObjectTainted,
+			}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+			s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.r3"), &states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"test_string":"r3"}`),
+				Status:    states.ObjectTainted,
+			}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+		})
+
+		m := testModuleInline(t, map[string]string{
+			"main.tf": `
+resource "test_object" "r1" {
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "test_object" "r2" {
+  lifecycle {
+    replace_triggered_by = [test_object.r3]
+  }
+  depends_on = [test_object.r1]
+}
+
+resource "test_object" "r3" {
+  test_string = null
+}
+`})
+
+		p := simpleMockProvider()
+
+		hook := new(MockHook)
+		ctx := testContext2(t, &ContextOpts{
+			Hooks: []Hook{hook},
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+			},
+		})
+
+		plan, diags := ctx.Plan(m, state, &PlanOpts{Mode: plans.NormalMode})
+		if assertNoDiagnostics(t, diags) {
+			t.Fatal(diags.ErrWithWarnings())
+		}
+
+		_, applyDiags := ctx.Apply(plan, m, nil)
+		assertNoDiagnostics(t, applyDiags)
+	})
+}
+
+func TestContext2Apply_forget_createBeforeDestroy(t *testing.T) {
+	tests := map[string]string{
+		"explicit": `
+resource "test_object" "forget" {
+	lifecycle {
+		destroy               = false
+		create_before_destroy = true
+	}
+}
+`,
+		"propagated": `
+resource "test_object" "forget" {
+	lifecycle {
+		destroy = false
+	}
+}
+
+resource "test_object" "dependent" {
+	depends_on = [test_object.forget]
+
+	lifecycle {
+		create_before_destroy = true
+	}
+}
+`,
+	}
+
+	for name, config := range tests {
+		t.Run(name, func(t *testing.T) {
+			m := testModuleInline(t, map[string]string{
+				"main.tf": config,
+			})
+
+			p := simpleMockProvider()
+			createCalls := 0
+			p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+				if req.PlannedState.IsNull() {
+					t.Fatal("provider was asked to destroy an object")
+				}
+
+				if req.PriorState.IsNull() {
+					createCalls++
+				}
+				resp.NewState = req.PlannedState
+				return resp
+			}
+			ctx := testContext2(t, &ContextOpts{
+				Providers: map[addrs.Provider]providers.Factory{
+					addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+				},
+			})
+
+			forget := mustResourceInstanceAddr("test_object.forget")
+			state := states.NewState()
+			root := state.EnsureModule(addrs.RootModuleInstance)
+			root.SetResourceInstanceCurrent(
+				forget.Resource,
+				&states.ResourceInstanceObjectSrc{
+					Status:    states.ObjectTainted,
+					AttrsJSON: []byte(`{"test_string":"old"}`),
+				},
+				mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
+			)
+			if name == "propagated" {
+				root.SetResourceInstanceCurrent(
+					mustResourceInstanceAddr("test_object.dependent").Resource,
+					&states.ResourceInstanceObjectSrc{
+						Status:    states.ObjectReady,
+						AttrsJSON: []byte(`{}`),
+					},
+					mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
+				)
+			}
+
+			plan, diags := ctx.Plan(m, state, nil)
+			tfdiags.AssertNoErrors(t, diags)
+			change := plan.Changes.ResourceInstance(forget)
+			if change == nil {
+				t.Fatal("expected a change")
+			}
+			if got, want := change.Action, plans.CreateThenForget; got != want {
+				t.Fatalf("wrong change type for %s: got %s, want %s", forget, got, want)
+			}
+
+			state, diags = ctx.Apply(plan, m, nil)
+			tfdiags.AssertNoErrors(t, diags)
+			if got, want := createCalls, 1; got != want {
+				t.Fatalf("wrong number of provider create calls: got %d, want %d", got, want)
+			}
+
+			instance := state.ResourceInstance(forget)
+			if instance == nil || instance.Current == nil {
+				t.Fatalf("%s has no current object after replacement", forget)
+			}
+			if got := len(instance.Deposed); got != 0 {
+				t.Fatalf("%s has %d deposed objects after replacement; want none", forget, got)
+			}
+		})
+	}
+}
+
+func TestContext2Apply_forget_createBeforeDestroyInvalidResult(t *testing.T) {
+	initialConfig := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "forget" {
+	test_string = "old"
+
+	lifecycle {
+		destroy               = false
+		create_before_destroy = true
+	}
+}
+`,
+	})
+
+	replacementConfig := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "forget" {
+	test_string = "new"
+
+	lifecycle {
+		destroy               = false
+		create_before_destroy = true
+	}
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) (resp providers.PlanResourceChangeResponse) {
+		resp.PlannedState = req.ProposedNewState
+		if req.PriorState.IsNull() || req.ProposedNewState.IsNull() {
+			return resp
+		}
+		if !req.PriorState.GetAttr("test_string").RawEquals(req.ProposedNewState.GetAttr("test_string")) {
+			resp.RequiresReplace = []cty.Path{cty.GetAttrPath("test_string")}
+		}
+		return resp
+	}
+	createCalls := 0
+	p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+		if req.PlannedState.IsNull() {
+			t.Fatal("provider was asked to destroy an object")
+		}
+		if req.PriorState.IsNull() {
+			createCalls++
+		}
+		resp.NewState = req.PlannedState
+		return resp
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(initialConfig, states.NewState(), nil)
+	tfdiags.AssertNoErrors(t, diags)
+	state, diags := ctx.Apply(plan, initialConfig, nil)
+	tfdiags.AssertNoErrors(t, diags)
+	if got, want := createCalls, 1; got != want {
+		t.Fatalf("wrong number of provider create calls after initial apply: got %d, want %d", got, want)
+	}
+
+	plan, diags = ctx.Plan(replacementConfig, state, nil)
+	tfdiags.AssertNoErrors(t, diags)
+	_, diags = ctx.Apply(plan, replacementConfig, nil)
+	tfdiags.AssertNoErrors(t, diags)
+	if got, want := createCalls, 2; got != want {
+		t.Fatalf("wrong total number of provider create calls: got %d, want %d", got, want)
+	}
+}
+
+func TestContext2Apply_forget_replace(t *testing.T) {
+	// https://github.com/hashicorp/terraform/issues/39088
+	// we have a resource in state that needs replacing, and forget statement, but we're doing a replace
+	// don't be weird about it
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "forget" {
+	test_string = "hello"
+	lifecycle {
+		destroy = false
+	}
+}
+`})
+
+	p := simpleMockProvider()
+
+	hook := new(MockHook)
+	ctx := testContext2(t, &ContextOpts{
+		Hooks: []Hook{hook},
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	forget := mustResourceInstanceAddr("test_object.forget")
+
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		forget.Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"test_string":"hi"}`),
+		},
+		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
+	)
+
+	// need the provider to return a requires_replace (or otherwise force replace)
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) (resp providers.PlanResourceChangeResponse) {
+		obj := req.ProposedNewState.AsValueMap()
+
+		if req.Config.IsNull() {
+			t.Fatal("should not plan a destroy")
+		}
+
+		if !req.PriorState.IsNull() {
+			if req.PriorState.GetAttr("test_string").AsString() != "hello" {
+				resp.RequiresReplace = append(resp.RequiresReplace, cty.GetAttrPath("test_string"))
+			}
+		}
+
+		resp.PlannedState = cty.ObjectVal(obj)
+		return resp
+	}
+
+	p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+		if req.PlannedState.IsNull() {
+			t.Fatal("should not be applying a destroy")
+		}
+
+		resp.NewState = req.PlannedState
+		return resp
+	}
+
+	plan, diags := ctx.Plan(m, state, nil)
+	if !diags.HasWarnings() { // forgetting emits a warning, but there should be no errors.
+		t.Errorf("missing expected forget warning")
+	}
+	assertNoDiagnostics(t, diags.ErrorsOnly())
+	change := plan.Changes.ResourceInstance(forget)
+	if change == nil {
+		t.Fatal("expected a change")
+	}
+	if got, want := change.Action, plans.ForgetThenCreate; got != want {
+		t.Fatalf("wrong change type for %s: got %s, want %s", forget, got, want)
+	}
+
+	state, applyDiags := ctx.Apply(plan, m, nil)
+	assertNoDiagnostics(t, applyDiags)
+
+	replaced := state.Resources(forget.ConfigResource())
+	if len(replaced) != 1 {
+		t.Fatal("expected one resource in state")
+	}
+
+	if len(replaced[0].Instances[addrs.NoKey].Deposed) != 0 {
+		t.Fatal("should be no deposed instances")
+	}
+}
+
+// A create that fails with a partial state must never be visible in the
+// working state with an invalid status, because concurrent nodes may be
+// persisting state snapshots at any time.
+func TestContext2Apply_failedCreateStatusVisibleToConcurrentStateUpdate(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "a" {
+  test_string = "a"
+  provisioner "shell" {}
+}
+
+resource "test_object" "b" {
+  test_string = "b"
+}
+`,
+	})
+
+	// b is held until a is either provisioning or complete
+	releaseB := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseB) }) }
+	bPersisted := make(chan struct{})
+
+	p := simpleMockProvider()
+	p.ApplyResourceChangeFn = func(req providers.ApplyResourceChangeRequest) (resp providers.ApplyResourceChangeResponse) {
+		resp.NewState = req.PlannedState
+		if req.PlannedState.GetAttr("test_string").AsString() == "a" {
+			resp.Diagnostics = resp.Diagnostics.Append(errors.New("create failed"))
+		}
+		return resp
+	}
+
+	pr := testProvisioner()
+	pr.ProvisionResourceFn = func(req provisioners.ProvisionResourceRequest) (resp provisioners.ProvisionResourceResponse) {
+		release()
+		select {
+		case <-bPersisted:
+		case <-time.After(5 * time.Second):
+			panic("timeout")
+		}
+		return resp
+	}
+
+	hook := &stateSerializingTestHook{
+		onPreApply: func(addr addrs.AbsResourceInstance) {
+			if addr.Equal(mustResourceInstanceAddr("test_object.b")) {
+				select {
+				case <-releaseB:
+				case <-time.After(5 * time.Second):
+					panic("timeout")
+				}
+			}
+		},
+		onPostApply: func(addr addrs.AbsResourceInstance) {
+			if addr.Equal(mustResourceInstanceAddr("test_object.a")) {
+				release()
+			}
+		},
+		onUpdate: func(s *states.State) {
+			if s.ResourceInstance(mustResourceInstanceAddr("test_object.b")) != nil {
+				select {
+				case <-bPersisted:
+				default:
+					close(bPersisted)
+				}
+			}
+		},
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Hooks: []Hook{hook},
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Provisioners: map[string]provisioners.Factory{
+			"shell": testProvisionerFuncFixed(pr),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, states.NewState(), DefaultPlanOpts)
+	tfdiags.AssertNoErrors(t, diags)
+
+	state, diags := ctx.Apply(plan, m, nil)
+	if !diags.HasErrors() {
+		t.Fatal("expected apply error")
+	}
+
+	for _, err := range hook.errs() {
+		t.Errorf("state snapshot could not be serialized: %s", err)
+	}
+
+	if pr.ProvisionResourceCalled {
+		t.Error("provisioner should not run for a failed create")
+	}
+
+	a := state.ResourceInstance(mustResourceInstanceAddr("test_object.a"))
+	if a == nil || a.Current == nil || a.Current.Status != states.ObjectTainted {
+		t.Fatalf("expected test_object.a to be tainted, got %#v", a)
+	}
+}
+
+// stateSerializingTestHook serializes every state snapshot, as the local backend's
+// StateHook does via statemgr.Filesystem.
+type stateSerializingTestHook struct {
+	NilHook
+
+	mu          sync.Mutex
+	serErrs     []error
+	onPreApply  func(addrs.AbsResourceInstance)
+	onPostApply func(addrs.AbsResourceInstance)
+	onUpdate    func(*states.State)
+}
+
+func (h *stateSerializingTestHook) PostApply(id HookResourceIdentity, dk addrs.DeposedKey, newState cty.Value, err error) (HookAction, error) {
+	if h.onPostApply != nil {
+		h.onPostApply(id.Addr)
+	}
+	return HookActionContinue, nil
+}
+
+func (h *stateSerializingTestHook) PreApply(id HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value) (HookAction, error) {
+	if h.onPreApply != nil {
+		h.onPreApply(id.Addr)
+	}
+	return HookActionContinue, nil
+}
+
+func (h *stateSerializingTestHook) PostStateUpdate(s *states.State) (HookAction, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := statefile.Write(&statefile.File{State: s}, &bytes.Buffer{}); err != nil {
+		h.serErrs = append(h.serErrs, err)
+	}
+	if h.onUpdate != nil {
+		h.onUpdate(s)
+	}
+	return HookActionContinue, nil
+}
+
+func (h *stateSerializingTestHook) errs() []error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.serErrs
+}
+
+func TestContext2Apply_AllowRootDeprecatedOutputs(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+output "old" {
+  value      = "example"
+  deprecated = "Use the new output."
+}
+`,
+	})
+	ctx := testContext2(t, &ContextOpts{})
+
+	opts := &PlanOpts{
+		Mode:                       plans.NormalMode,
+		AllowRootDeprecatedOutputs: true,
+	}
+	plan, diags := ctx.Plan(m, states.NewState(), opts)
+	tfdiags.AssertDiagnosticsMatch(t, diags, nil)
+
+	state, diags := ctx.Apply(plan, m, opts.ApplyOpts())
+	tfdiags.AssertDiagnosticsMatch(t, diags, nil)
+
+	output := state.RootOutputValues["old"]
+	if output == nil || !output.Value.RawEquals(cty.StringVal("example")) {
+		t.Fatalf("unexpected root output: %#v", output)
 	}
 }

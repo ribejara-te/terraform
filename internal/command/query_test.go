@@ -4,6 +4,7 @@
 package command
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,12 +13,17 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/terraform/internal/backend/backendrun"
+	backendLocal "github.com/hashicorp/terraform/internal/backend/local"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/policy"
+	"github.com/hashicorp/terraform/internal/policy/proto"
 	"github.com/hashicorp/terraform/internal/providers"
 	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -306,64 +312,197 @@ func TestQueryCommand_Validate(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	emptyDir := t.TempDir()
+	filePath := filepath.Join(td, "main.policy.hcl")
 	missingPath := filepath.Join(t.TempDir(), "does-not-exist")
 
+	// Symlink support is not guaranteed on every platform we test on, so the
+	// symlink cases are only registered when we can actually create them.
+	linkRoot := t.TempDir()
+	dirLink := filepath.Join(linkRoot, "dir-link")
+	fileLink := filepath.Join(linkRoot, "file-link")
+	danglingLink := filepath.Join(linkRoot, "dangling-link")
+	symlinksSupported := true
+	for target, link := range map[string]string{
+		td:          dirLink,
+		filePath:    fileLink,
+		missingPath: danglingLink,
+	} {
+		if err := os.Symlink(target, link); err != nil {
+			symlinksSupported = false
+			break
+		}
+	}
+
+	notADirDiags := func(path string) tfdiags.Diagnostics {
+		return tfdiags.Diagnostics{
+			tfdiags.Sourceless(
+				tfdiags.Error,
+				"Invalid policy path",
+				fmt.Sprintf("The policy path %s is not a directory. The -policies option requires the path of a policy set directory, not an individual policy file.", path),
+			),
+		}
+	}
+	missingDiags := func(path string) tfdiags.Diagnostics {
+		return tfdiags.Diagnostics{
+			tfdiags.Sourceless(
+				tfdiags.Error,
+				"Invalid policy path",
+				fmt.Sprintf("Terraform cannot find the policy path at %s. The -policies option requires the path of an existing policy set directory.", path),
+			),
+		}
+	}
+
 	tests := []struct {
-		name             string
-		policyPaths      []string
-		allowExperiments bool
-		wantDiags        tfdiags.Diagnostics
+		name        string
+		policyPaths []string
+		symlinks    bool
+		wantDiags   tfdiags.Diagnostics
 	}{
 		{
-			name:             "no policies, flag omitted",
-			policyPaths:      nil,
-			allowExperiments: true,
+			name: "no policies, flag omitted",
 		},
 		{
-			name:             "single valid path",
-			policyPaths:      []string{td},
-			allowExperiments: true,
+			name:        "single valid path",
+			policyPaths: []string{td},
 		},
 		{
-			name:             "multiple valid paths",
-			policyPaths:      []string{td, td2},
-			allowExperiments: true,
+			name:        "multiple valid paths",
+			policyPaths: []string{td, td2},
 		},
 		{
-			name:             "non-existent path",
-			policyPaths:      []string{missingPath},
-			allowExperiments: true,
+			// Whether a directory actually contains any policies is for the
+			// policy engine to decide, not for CLI path validation.
+			name:        "empty directory",
+			policyPaths: []string{emptyDir},
+		},
+		{
+			name:        "non-existent path",
+			policyPaths: []string{missingPath},
+			wantDiags:   missingDiags(missingPath),
+		},
+		{
+			name:        "empty path",
+			policyPaths: []string{""},
 			wantDiags: tfdiags.Diagnostics{
 				tfdiags.Sourceless(
 					tfdiags.Error,
 					"Invalid policy path",
-					fmt.Sprintf("Terraform cannot find the policy path at %s. Please ensure the file or directory exists and the path is correct.", missingPath),
+					"The -policies option requires the path of a policy set directory, but was given an empty value.",
 				),
 			},
 		},
 		{
-			name:             "experiments disallowed",
-			policyPaths:      []string{td},
-			allowExperiments: false,
-			wantDiags: tfdiags.Diagnostics{
-				tfdiags.Sourceless(
-					tfdiags.Error,
-					"Failed to parse command-line flags",
-					"The -policies flag is only valid in experimental builds of Terraform.",
-				),
-			},
+			name:        "regular file",
+			policyPaths: []string{filePath},
+			wantDiags:   notADirDiags(filePath),
+		},
+		{
+			name:        "valid directories mixed with a regular file",
+			policyPaths: []string{td, filePath, td2},
+			wantDiags:   notADirDiags(filePath),
+		},
+		{
+			// Every supplied path is validated, so more than one of them can
+			// be reported at once.
+			name:        "multiple invalid paths",
+			policyPaths: []string{td, filePath, missingPath},
+			wantDiags:   append(notADirDiags(filePath), missingDiags(missingPath)...),
+		},
+		{
+			name:        "symlink to a directory",
+			policyPaths: []string{dirLink},
+			symlinks:    true,
+		},
+		{
+			name:        "symlink to a file",
+			policyPaths: []string{fileLink},
+			symlinks:    true,
+			wantDiags:   notADirDiags(fileLink),
+		},
+		{
+			name:        "dangling symlink",
+			policyPaths: []string{danglingLink},
+			symlinks:    true,
+			wantDiags:   missingDiags(danglingLink),
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cmd := &QueryCommand{Meta: Meta{AllowExperimentalFeatures: tc.allowExperiments}}
+			if tc.symlinks && !symlinksSupported {
+				t.Skip("symlinks are not supported on this platform")
+			}
+			cmd := &QueryCommand{}
 			got := cmd.Validate(&arguments.Query{PolicyPaths: tc.policyPaths})
 			if tc.wantDiags == nil {
 				tfdiags.AssertNoDiagnostics(t, got)
 				return
 			}
 			tfdiags.AssertDiagnosticsMatch(t, got, tc.wantDiags)
+		})
+	}
+
+	// A relative path to an existing directory is valid too.
+	t.Run("relative directory path", func(t *testing.T) {
+		t.Chdir(filepath.Dir(td))
+		cmd := &QueryCommand{}
+		got := cmd.Validate(&arguments.Query{PolicyPaths: []string{filepath.Base(td)}})
+		tfdiags.AssertNoDiagnostics(t, got)
+	})
+}
+
+type queryPolicyRemoteCommandBackend struct {
+	backendrun.OperationsBackend
+	local bool
+}
+
+func (*queryPolicyRemoteCommandBackend) IgnoreVersionConflict() {}
+
+func (*queryPolicyRemoteCommandBackend) VerifyWorkspaceTerraformVersion(string) tfdiags.Diagnostics {
+	return nil
+}
+
+func (b *queryPolicyRemoteCommandBackend) IsLocalOperations() bool {
+	return b.local
+}
+
+func TestQueryCommand_policyClientRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		remote      bool
+		forceLocal  bool
+		policyPaths []string
+		wantClient  bool
+	}{
+		{name: "remote", remote: true, policyPaths: []string{"policy.tfpolicy.hcl"}},
+		{name: "forced local", remote: true, forceLocal: true, policyPaths: []string{"policy.tfpolicy.hcl"}, wantClient: true},
+		{name: "local", policyPaths: []string{"policy.tfpolicy.hcl"}, wantClient: true},
+		{name: "no policies"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var be backendrun.OperationsBackend = backendLocal.New()
+			if tc.remote {
+				be = &queryPolicyRemoteCommandBackend{OperationsBackend: be, local: tc.forceLocal}
+			}
+
+			client := policy.NewTestMockClient(t)
+			cmd := &QueryCommand{Meta: Meta{
+				testingOverrides: &testingOverrides{PolicyClient: client},
+			}}
+			op := &backendrun.Operation{PolicyPaths: tc.policyPaths}
+			stop := cmd.configureQueryPolicyClient(be, op)
+			stop()
+			if tc.wantClient {
+				if op.PolicyClient != client {
+					t.Fatal("policy client was not propagated to the operation")
+				}
+			} else if op.PolicyClient != nil {
+				t.Fatal("remote operation unexpectedly received a local policy client")
+			}
+			if client.StopCalled != tc.wantClient {
+				t.Fatalf("policy client stopped = %t, want %t", client.StopCalled, tc.wantClient)
+			}
 		})
 	}
 }
@@ -421,6 +560,12 @@ func queryFixtureProvider() *testing_provider.MockProvider {
 		},
 	}
 	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		Provider: providers.Schema{
+			Body: &configschema.Block{
+				Attributes: map[string]*configschema.Attribute{},
+				BlockTypes: map[string]*configschema.NestedBlock{},
+			},
+		},
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Body: &configschema.Block{
@@ -552,6 +697,363 @@ func queryFixtureProvider() *testing_provider.MockProvider {
 	}
 
 	return p
+}
+
+func TestQueryPolicyStatusReporting(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("query", "basic")), td)
+	t.Chdir(td)
+
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+	p := queryFixtureProvider()
+	p.GetProviderSchemaResponse.ServerCapabilities.GenerateResourceConfig = true
+	p.ListResourceFn = func(request providers.ListResourceRequest) providers.ListResourceResponse {
+		config := request.Config.GetAttr("config")
+		rows := make([]cty.Value, 0, 3)
+		for idx := 1; idx <= 3; idx++ {
+			id := fmt.Sprintf("test-instance-%d", idx)
+			rows = append(rows, cty.ObjectVal(map[string]cty.Value{
+				"identity": cty.ObjectVal(map[string]cty.Value{
+					"id": cty.StringVal(id),
+				}),
+				"state": cty.ObjectVal(map[string]cty.Value{
+					"id":  cty.StringVal(id),
+					"ami": cty.StringVal(id),
+				}),
+				"display_name": cty.StringVal(fmt.Sprintf("Test Instance %d", idx)),
+			}))
+		}
+		return providers.ListResourceResponse{Result: cty.ObjectVal(map[string]cty.Value{
+			"data":   cty.ListVal(rows),
+			"config": config,
+		})}
+	}
+	p.GenerateResourceConfigFn = func(request providers.GenerateResourceConfigRequest) providers.GenerateResourceConfigResponse {
+		id := request.State.GetAttr("id").AsString()
+		if id == "test-instance-1" {
+			return providers.GenerateResourceConfigResponse{Diagnostics: tfdiags.Diagnostics{
+				tfdiags.Sourceless(tfdiags.Error, "config generation failed", "could not generate resource configuration"),
+			}}
+		}
+		return providers.GenerateResourceConfigResponse{Config: cty.ObjectVal(map[string]cty.Value{
+			"id":  cty.NullVal(cty.String),
+			"ami": cty.StringVal(id),
+		})}
+	}
+
+	var evaluated []string
+	policyClient := policy.NewTestMockClient(t)
+	policyClient.EvaluateFn = func(_ context.Context, request policy.EvaluationRequest[*proto.PolicyEvaluateResourceRequest_ResourceMetadata]) policy.EvaluationResponse {
+		id := request.Attrs.Raw.GetAttr("ami").AsString()
+		evaluated = append(evaluated, id)
+		switch id {
+		case "test-instance-2":
+			return policy.ErrorEvalFromDiags([]*proto.Diagnostic{{
+				Severity: proto.Severity_ERROR,
+				Summary:  "Failed to evaluate Terraform Policy",
+				Detail:   "policy transport unavailable",
+			}})
+		case "test-instance-3":
+			return policy.EvaluationFromProtoResponse(proto.EvaluateResult_ALLOW_EVALUATE_RESULT, nil)
+		default:
+			t.Fatalf("unexpected policy evaluation for %q", id)
+			return policy.EvaluationResponse{}
+		}
+	}
+
+	overrides := metaOverridesForProvider(p)
+	overrides.PolicyClient = policyClient
+	view, done := testView(t)
+	meta := Meta{
+		testingOverrides: overrides,
+		View:             view,
+		ProviderSource:   providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run(nil); code != 0 {
+		t.Fatalf("init failed with status %d:\n%s", code, done(t).All())
+	}
+
+	view, done = testView(t)
+	meta.View = view
+	command := &QueryCommand{Meta: meta}
+	code := command.Run([]string{"-no-color", "-json", "-policies=."})
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("query failed with status %d:\n%s", code, output.All())
+	}
+
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(output.Stdout()), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("failed to decode JSON line %q: %s", line, err)
+		}
+		records = append(records, record)
+	}
+
+	var foundResources, summaries, policyDiagnostics []map[string]any
+	for _, record := range records {
+		switch record["type"] {
+		case "list_resource_found":
+			foundResources = append(foundResources, record)
+		case "policy_query_summary":
+			summaries = append(summaries, record)
+		case "policy_diagnostic":
+			policyDiagnostics = append(policyDiagnostics, record)
+		}
+	}
+	if len(foundResources) != 3 {
+		t.Fatalf("list_resource_found records = %d, want 3", len(foundResources))
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("policy_query_summary records = %d, want 1", len(summaries))
+	}
+	if len(policyDiagnostics) != 1 {
+		t.Fatalf("policy_diagnostic records = %d, want 1", len(policyDiagnostics))
+	}
+	if len(evaluated) != 2 || slices.Contains(evaluated, "test-instance-1") || !slices.Contains(evaluated, "test-instance-2") || !slices.Contains(evaluated, "test-instance-3") {
+		t.Fatalf("evaluated resources = %v, want only test-instance-2 and test-instance-3", evaluated)
+	}
+
+	summary := summaries[0]
+	if summary["overall_result"] != "error" {
+		t.Fatalf("summary overall_result = %v, want error", summary["overall_result"])
+	}
+	passedPolicies, ok := summary["passed_policies"].([]any)
+	if !ok || len(passedPolicies) != 0 {
+		t.Fatalf("passed_policies = %#v, want []", summary["passed_policies"])
+	}
+	rows := summary["results"].([]any)
+	if len(rows) != 3 {
+		t.Fatalf("summary rows = %d, want 3", len(rows))
+	}
+	rowsByID := make(map[string]map[string]any, len(rows))
+	for _, rawRow := range rows {
+		row := rawRow.(map[string]any)
+		identity := row["identity"].(map[string]any)
+		rowsByID[identity["id"].(string)] = row
+		policies, ok := row["policies"].([]any)
+		if !ok || len(policies) != 0 {
+			t.Fatalf("row %v policies = %#v, want []", identity["id"], row["policies"])
+		}
+	}
+	wantResults := map[string]string{
+		"test-instance-1": "unknown",
+		"test-instance-2": "error",
+		"test-instance-3": "n/a",
+	}
+	for id, want := range wantResults {
+		row := rowsByID[id]
+		if row == nil || row["result"] != want {
+			t.Fatalf("row %s = %#v, want result %s", id, row, want)
+		}
+	}
+
+	diagnostic := policyDiagnostics[0]
+	if diagnostic["target_address"] != "test_instance.example_1" {
+		t.Fatalf("policy diagnostic target = %v, want test_instance.example_1", diagnostic["target_address"])
+	}
+}
+
+func TestQueryPolicyStatusReporting_NoPoliciesArgument(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("query", "basic")), td)
+	t.Chdir(td)
+
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+	p := queryFixtureProvider()
+	policyClient := policy.NewTestMockClient(t)
+	var policyClientCalled atomic.Bool
+	policyClient.EvaluateFn = func(context.Context, policy.EvaluationRequest[*proto.PolicyEvaluateResourceRequest_ResourceMetadata]) policy.EvaluationResponse {
+		policyClientCalled.Store(true)
+		return policy.EvaluationResponse{Overall: policy.AllowResult}
+	}
+	policyClient.StopFn = func() {
+		policyClientCalled.Store(true)
+	}
+
+	overrides := metaOverridesForProvider(p)
+	overrides.PolicyClient = policyClient
+	view, done := testView(t)
+	meta := Meta{
+		testingOverrides: overrides,
+		View:             view,
+		ProviderSource:   providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	code := init.Run(nil)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("init failed with status %d:\n%s", code, output.All())
+	}
+
+	view, done = testView(t)
+	meta.View = view
+	command := &QueryCommand{Meta: meta}
+	code = command.Run([]string{"-no-color", "-json"})
+	output = done(t)
+	if code != 0 {
+		t.Fatalf("query failed with status %d:\n%s", code, output.All())
+	}
+
+	var foundResources, summaries, policyDiagnostics int
+	for _, line := range strings.Split(strings.TrimSpace(output.Stdout()), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("failed to decode JSON line %q: %s", line, err)
+		}
+		switch record["type"] {
+		case "list_resource_found":
+			foundResources++
+		case "policy_query_summary":
+			summaries++
+		case "policy_diagnostic":
+			policyDiagnostics++
+		}
+	}
+
+	if foundResources != 2 {
+		t.Fatalf("list_resource_found records = %d, want 2", foundResources)
+	}
+	if summaries != 0 {
+		t.Fatalf("policy_query_summary records = %d, want 0", summaries)
+	}
+	if policyDiagnostics != 0 {
+		t.Fatalf("policy_diagnostic records = %d, want 0", policyDiagnostics)
+	}
+	if policyClientCalled.Load() {
+		t.Fatal("policy client was called without -policies")
+	}
+}
+
+// TestQueryCommand_policyPathNotADirectory checks that pointing -policies at an
+// existing regular file fails the command before it prepares a backend, starts
+// a policy client, or runs the query, in both the human and JSON views.
+func TestQueryCommand_policyPathNotADirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flag string
+		json bool
+	}{
+		{name: "human, single dash", flag: "-policies"},
+		{name: "json, double dash", flag: "--policies", json: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			td := t.TempDir()
+			testCopyDir(t, testFixturePath(path.Join("query", "basic")), td)
+			t.Chdir(td)
+
+			policyFile := filepath.Join(td, "allow.tfpolicy.hcl")
+			if err := os.WriteFile(policyFile, []byte(""), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			providerSource := newMockProviderSource(t, map[string][]string{
+				"hashicorp/test": {"1.0.0"},
+			})
+			p := queryFixtureProvider()
+
+			policyClient := policy.NewTestMockClient(t)
+			var policyClientUsed atomic.Bool
+			policyClient.EvaluateFn = func(context.Context, policy.EvaluationRequest[*proto.PolicyEvaluateResourceRequest_ResourceMetadata]) policy.EvaluationResponse {
+				policyClientUsed.Store(true)
+				return policy.EvaluationResponse{Overall: policy.AllowResult}
+			}
+			policyClient.StopFn = func() {
+				policyClientUsed.Store(true)
+			}
+
+			overrides := metaOverridesForProvider(p)
+			overrides.PolicyClient = policyClient
+			view, done := testView(t)
+			meta := Meta{
+				testingOverrides: overrides,
+				View:             view,
+				ProviderSource:   providerSource,
+			}
+
+			init := &InitCommand{Meta: meta}
+			if code := init.Run(nil); code != 0 {
+				t.Fatalf("init failed with status %d:\n%s", code, done(t).All())
+			}
+
+			view, done = testView(t)
+			meta.View = view
+			command := &QueryCommand{Meta: meta}
+
+			args := []string{"-no-color", tc.flag + "=" + policyFile}
+			if tc.json {
+				args = append(args, "-json")
+			}
+			code := command.Run(args)
+			output := done(t)
+
+			if code != 1 {
+				t.Fatalf("query exited with status %d, want 1:\n%s", code, output.All())
+			}
+
+			wantDetail := fmt.Sprintf("The policy path %s is not a directory.", policyFile)
+			if tc.json {
+				var found bool
+				for _, line := range strings.Split(strings.TrimSpace(output.Stdout()), "\n") {
+					if line == "" {
+						continue
+					}
+					var record map[string]any
+					if err := json.Unmarshal([]byte(line), &record); err != nil {
+						t.Fatalf("failed to decode JSON line %q: %s", line, err)
+					}
+					if record["type"] == "list_resource_found" {
+						t.Fatalf("query produced results despite an invalid policy path:\n%s", output.Stdout())
+					}
+					if record["type"] != "diagnostic" {
+						continue
+					}
+					diagnostic, ok := record["diagnostic"].(map[string]any)
+					if !ok {
+						t.Fatalf("diagnostic record has no diagnostic object: %s", line)
+					}
+					if diagnostic["severity"] != "error" || diagnostic["summary"] != "Invalid policy path" {
+						continue
+					}
+					detail, _ := diagnostic["detail"].(string)
+					if !strings.Contains(detail, wantDetail) {
+						t.Fatalf("diagnostic detail = %q, want it to contain %q", detail, wantDetail)
+					}
+					found = true
+				}
+				if !found {
+					t.Fatalf("no \"Invalid policy path\" diagnostic in JSON output:\n%s", output.All())
+				}
+			} else {
+				// The human view wraps long lines, so we check the significant
+				// fragments rather than the whole sentence.
+				got := output.Stderr()
+				for _, want := range []string{"Invalid policy path", policyFile, "is not a directory"} {
+					if !strings.Contains(got, want) {
+						t.Fatalf("missing expected error message\nwant message containing %q\ngot:\n%s", want, got)
+					}
+				}
+				if got := output.Stdout(); strings.Contains(got, "list.test_instance") {
+					t.Fatalf("query produced results despite an invalid policy path:\n%s", got)
+				}
+			}
+
+			if p.ListResourceCalled {
+				t.Fatal("query was executed despite an invalid policy path")
+			}
+			if policyClientUsed.Load() {
+				t.Fatal("policy client was started despite an invalid policy path")
+			}
+		})
+	}
 }
 
 func TestQuery_JSON(t *testing.T) {

@@ -92,7 +92,7 @@ func TestInit_empty(t *testing.T) {
 	if code := c.Run(args); code != 0 {
 		t.Fatalf("bad: \n%s", done(t).All())
 	}
-	exp := views.MessageRegistry[views.OutputInitEmptyMessage].JSONValue
+	exp := "Terraform initialized in an empty directory!"
 	actual := cleanString(done(t).All())
 	if !strings.Contains(actual, cleanString(exp)) {
 		t.Fatalf("expected output to be %q\n, got %q", exp, actual)
@@ -123,7 +123,7 @@ func TestInit_only_test_files(t *testing.T) {
 	if code := c.Run(args); code != 0 {
 		t.Fatalf("bad: \n%s", done(t).All())
 	}
-	exp := views.MessageRegistry[views.OutputInitSuccessCLIMessage].JSONValue
+	exp := "You may now begin working with Terraform"
 	actual := cleanString(done(t).All())
 	if !strings.Contains(actual, cleanString(exp)) {
 		t.Fatalf("expected output to be %q\n, got %q", exp, actual)
@@ -139,7 +139,7 @@ func TestInit_two_source_provider_download(t *testing.T) {
 		"providers required by only the state file": {
 			workDirPath: "init-provider-download/state-file-only",
 			expectedDownloadMsgs: []string{
-				views.MessageRegistry[views.OutputInitSuccessCLIMessage].JSONValue,
+				"You may now begin working with Terraform",
 				`Initializing the backend...
 				Successfully configured the backend "local"!`, // No providers found in the configuration so next output is backend-related
 				`Initializing provider plugins...
@@ -150,7 +150,7 @@ func TestInit_two_source_provider_download(t *testing.T) {
 		"different providers required by config and state": {
 			workDirPath: "init-provider-download/config-and-state-different-providers",
 			expectedDownloadMsgs: []string{
-				views.MessageRegistry[views.OutputInitSuccessCLIMessage].JSONValue,
+				"You may now begin working with Terraform",
 				"Initializing provider plugins...",
 				// Config - null provider is affected by a version constraint
 				`- Finding hashicorp/null versions matching "< 9.0.0"...`,
@@ -949,7 +949,7 @@ func TestInit_backendConfigFile(t *testing.T) {
 		}
 		flagConfigExtra := arguments.NewFlagNameValueSlice("-backend-config")
 		flagConfigExtra.Set("input.config")
-		_, diags := c.backendConfigOverrideBody(flagConfigExtra, schema)
+		_, diags := c.backendConfigOverrideBody(flagConfigExtra, schema, Backend)
 		if len(diags) != 0 {
 			t.Errorf("expected no diags, got: %s", diags.Err())
 		}
@@ -4496,7 +4496,7 @@ Initializing provider plugins...
 
 		// Allow the test to respond to the prompt to pick an
 		// existing workspace, given the selected one doesn't exist.
-		_ = testInputMap(t, map[string]string{
+		uiInput, _ := testInputMap(t, map[string]string{
 			"select-workspace": "1", // foobar1 in numbered list
 		})
 
@@ -4510,6 +4510,7 @@ Initializing provider plugins...
 				Providers: map[addrs.Provider]providers.Factory{
 					mockProviderAddress: providers.FactoryFixed(mockProvider),
 				},
+				UIInput: uiInput,
 			},
 			ProviderSource: providerSource,
 		}
@@ -4534,6 +4535,272 @@ Initializing provider plugins...
 		}
 		if currentWorkspace != "foobar1" {
 			t.Fatalf("expected init command to alter the selected workspace from 'default' to 'foobar1', but got: %s", currentWorkspace)
+		}
+	})
+}
+
+// Partial configuration allows users to override values in the config for:
+// - Top level attributes (via file path or key-value pair string value for -backend-config)
+// - Nested attributes (via file path value for -backend-config only, cannot be done via key-value pair)
+// Reference: https://github.com/hashicorp/terraform/issues/36911
+//
+// It is not possible to override blocks using partial configuration, including the `provider` block
+// inside the `state_store` block.
+//
+// The test cases below demonstrate what's possible and also what is not possible when combining
+// the PSS feature with partial configuration. Only top-level attributes in the schema for the store
+// implementation are overridable.
+func TestInit_stateStore_newWorkingDir_partialConfiguration(t *testing.T) {
+	// Reused in tests that successfully override config using -backend-config CLI flag.
+	v1_2_3, _ := version.NewVersion("1.2.3")
+	expectedState := &workdir.StateStoreConfigState{
+		Type:               "test_store",
+		ConfigRaw:          []byte("{\n      \"value\": \"OVERRIDDEN\"\n    }"), // impacted by use of -backend-config CLI flag
+		Hash:               uint64(4158988729),
+		ProviderSupplyMode: getproviders.ManagedByTerraform,
+		Provider: &workdir.ProviderConfigState{
+			Version: v1_2_3,
+			Source: &tfaddr.Provider{
+				Hostname:  tfaddr.DefaultProviderRegistryHost,
+				Namespace: "hashicorp",
+				Type:      "test",
+			},
+			ConfigRaw: []byte("{\n        \"region\": null\n      }"),
+		},
+	}
+
+	t.Run("state store attribute - key-value pair supplied via CLI flag", func(t *testing.T) {
+		// Create a temporary, uninitialized working directory with configuration including a state store
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath("init-with-state-store"), td)
+		t.Chdir(td)
+
+		mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+		mockProviderAddress := addrs.NewDefaultProvider("test")
+
+		providerSource := newMockProviderSource(t, map[string][]string{
+			// The test fixture config has no version constraints, so the latest version will
+			// be used; below is the 'latest' version in the test world.
+			"hashicorp/test": {"1.2.3"},
+		})
+
+		ui := testUiWrapped(t)
+		view, done := testView(t)
+		meta := Meta{
+			Ui:                        ui,
+			View:                      view,
+			AllowExperimentalFeatures: true,
+			testingOverrides: &testingOverrides{
+				Providers: map[addrs.Provider]providers.Factory{
+					mockProviderAddress: providers.FactoryFixed(mockProvider),
+				},
+			},
+			ProviderSource: providerSource,
+		}
+		c := &InitCommand{
+			Meta: meta,
+		}
+
+		args := []string{
+			"-enable-pluggable-state-storage-experiment=true",
+			`-backend-config=value=OVERRIDDEN`, // override the `value` attr in the mock hashcorp/test's test_store store
+		}
+		code := c.Run(args)
+		testOutput := done(t)
+		if code != 0 {
+			t.Fatalf("expected code 0 exit code, got %d, output: \n%s", code, testOutput.All())
+		}
+
+		// Assert contents of the backend state file
+		statePath := filepath.Join(meta.DataDir(), DefaultStateFilename)
+		sMgr := &clistate.LocalState{Path: statePath}
+		if err := sMgr.RefreshState(); err != nil {
+			t.Fatal("Failed to load state:", err)
+		}
+		s := sMgr.State()
+		if s == nil {
+			t.Fatal("expected backend state file to be created, but there isn't one")
+		}
+		if diff := cmp.Diff(s.StateStore, expectedState); diff != "" {
+			t.Fatalf("unexpected diff in backend state file's description of state store:\n%s", diff)
+		}
+	})
+
+	t.Run("state store attribute - file path supplied via CLI flag", func(t *testing.T) {
+		// Create a temporary, uninitialized working directory with configuration including a state store
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath("init-with-state-store"), td)
+		t.Chdir(td)
+
+		mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+		mockProviderAddress := addrs.NewDefaultProvider("test")
+
+		providerSource := newMockProviderSource(t, map[string][]string{
+			// The test fixture config has no version constraints, so the latest version will
+			// be used; below is the 'latest' version in the test world.
+			"hashicorp/test": {"1.2.3"},
+		})
+
+		ui := testUiWrapped(t)
+		view, done := testView(t)
+		meta := Meta{
+			Ui:                        ui,
+			View:                      view,
+			AllowExperimentalFeatures: true,
+			testingOverrides: &testingOverrides{
+				Providers: map[addrs.Provider]providers.Factory{
+					mockProviderAddress: providers.FactoryFixed(mockProvider),
+				},
+			},
+			ProviderSource: providerSource,
+		}
+		c := &InitCommand{
+			Meta: meta,
+		}
+
+		// Create file with partial configuration
+		partialConfigPath := filepath.Join(td, "overrides.test_store.tfbackend")
+		cfg := `value = "OVERRIDDEN"`
+		if err := os.WriteFile(partialConfigPath, []byte(cfg), 0644); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		args := []string{
+			"-enable-pluggable-state-storage-experiment=true",
+			fmt.Sprintf(`-backend-config=%s`, partialConfigPath), // override the `value` attr in the mock hashcorp/test's test_store store
+		}
+		code := c.Run(args)
+		testOutput := done(t)
+		if code != 0 {
+			t.Fatalf("expected code 0 exit code, got %d, output: \n%s", code, testOutput.All())
+		}
+
+		// Assert contents of the backend state file
+		statePath := filepath.Join(meta.DataDir(), DefaultStateFilename)
+		sMgr := &clistate.LocalState{Path: statePath}
+		if err := sMgr.RefreshState(); err != nil {
+			t.Fatal("Failed to load state:", err)
+		}
+		s := sMgr.State()
+		if s == nil {
+			t.Fatal("expected backend state file to be created, but there isn't one")
+		}
+
+		if diff := cmp.Diff(s.StateStore, expectedState); diff != "" {
+			t.Fatalf("unexpected diff in backend state file's description of state store:\n%s", diff)
+		}
+	})
+
+	t.Run("cannot impact provider configuration - key-value pair supplied via CLI flag", func(t *testing.T) {
+		// Create a temporary, uninitialized working directory with configuration including a state store
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath("init-with-state-store"), td)
+		t.Chdir(td)
+
+		mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+		mockProviderAddress := addrs.NewDefaultProvider("test")
+
+		providerSource := newMockProviderSource(t, map[string][]string{
+			// The test fixture config has no version constraints, so the latest version will
+			// be used; below is the 'latest' version in the test world.
+			"hashicorp/test": {"1.2.3"},
+		})
+
+		ui := testUiWrapped(t)
+		view, done := testView(t)
+		meta := Meta{
+			Ui:                        ui,
+			View:                      view,
+			AllowExperimentalFeatures: true,
+			testingOverrides: &testingOverrides{
+				Providers: map[addrs.Provider]providers.Factory{
+					mockProviderAddress: providers.FactoryFixed(mockProvider),
+				},
+			},
+			ProviderSource: providerSource,
+		}
+		c := &InitCommand{
+			Meta: meta,
+		}
+
+		// Using CLI flags to supply key-value pairs
+		args := []string{
+			"-enable-pluggable-state-storage-experiment=true",
+			`-backend-config=provider.region=OVERRIDDEN`, // attempting to change the `region` attr in the nested provider block
+		}
+		code := c.Run(args)
+		testOutput := done(t)
+		if code != 1 {
+			t.Fatalf("expected code 1 exit code, got %d, output: \n%s", code, testOutput.All())
+		}
+
+		if !strings.Contains(testOutput.Stderr(), "Invalid state store configuration argument") {
+			t.Fatalf("expected error output to report the config argument was invalid, got:\n %s", testOutput.All())
+		}
+	})
+
+	t.Run("cannot impact provider configuration - file path supplied via CLI flag", func(t *testing.T) {
+		// Create a temporary, uninitialized working directory with configuration including a state store
+		td := t.TempDir()
+		testCopyDir(t, testFixturePath("init-with-state-store"), td)
+		t.Chdir(td)
+
+		mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+		mockProviderAddress := addrs.NewDefaultProvider("test")
+
+		providerSource := newMockProviderSource(t, map[string][]string{
+			// The test fixture config has no version constraints, so the latest version will
+			// be used; below is the 'latest' version in the test world.
+			"hashicorp/test": {"1.2.3"},
+		})
+
+		ui := testUiWrapped(t)
+		view, done := testView(t)
+		meta := Meta{
+			Ui:                        ui,
+			View:                      view,
+			AllowExperimentalFeatures: true,
+			testingOverrides: &testingOverrides{
+				Providers: map[addrs.Provider]providers.Factory{
+					mockProviderAddress: providers.FactoryFixed(mockProvider),
+				},
+			},
+			ProviderSource: providerSource,
+		}
+		c := &InitCommand{
+			Meta: meta,
+		}
+
+		// Create file with partial configuration
+		partialConfigPath := filepath.Join(td, "overrides.test_store.tfbackend")
+		cfg := `provider "test" {
+  value = "OVERRIDDEN"
+}`
+		if err := os.WriteFile(partialConfigPath, []byte(cfg), 0644); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		args := []string{
+			"-enable-pluggable-state-storage-experiment=true",
+			fmt.Sprintf(`-backend-config=%s`, partialConfigPath), // override the `value` attr in the mock hashcorp/test's test_store store
+		}
+		code := c.Run(args)
+		testOutput := done(t)
+		if code != 1 {
+			t.Fatalf("expected code 1 exit code, got %d, output: \n%s", code, testOutput.All())
+		}
+
+		expectedErrorMsgs := []string{
+			// We've detected that the user is attempting to override the provider block in a state_store block.
+			"Error: Cannot partially override provider configuration in a state store block.",
+
+			// More generic error due to the state store's schema not including the provider block in it's schema.
+			"Error: Unsupported block type",
+		}
+		for _, expected := range expectedErrorMsgs {
+			if !strings.Contains(testOutput.Stderr(), expected) {
+				t.Fatalf("expected error output to include %q, got:\n %s", expected, testOutput.All())
+			}
 		}
 	})
 }
@@ -4618,7 +4885,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 
 		// Allow the test to respond to the pause in provider installation for
 		// checking the state storage provider.
-		inputWriter := testInputMap(t, map[string]string{
+		uiInput, inputWriter := testInputMap(t, map[string]string{
 			"approve-provider-test-1.2.3": "yes",
 		})
 
@@ -4632,6 +4899,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 				Providers: map[addrs.Provider]providers.Factory{
 					mockProviderAddress: providers.FactoryFixed(mockProvider),
 				},
+				UIInput: uiInput,
 			},
 			ProviderSource: source,
 		}
@@ -4764,7 +5032,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 
 		// Allow the test to respond to the pause in provider installation for
 		// checking the state storage provider.
-		inputWriter := testInputMap(t, map[string]string{
+		uiInput, inputWriter := testInputMap(t, map[string]string{
 			"approve-provider-test-1.2.3": "yes",
 		})
 
@@ -4778,6 +5046,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 				Providers: map[addrs.Provider]providers.Factory{
 					mockProviderAddress: providers.FactoryFixed(mockProvider),
 				},
+				UIInput: uiInput,
 			},
 			ProviderSource: source,
 		}
@@ -4844,7 +5113,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 
 		// Allow the test to respond to the pause in provider installation for
 		// checking the state storage provider.
-		inputWriter := testInputMap(t, map[string]string{
+		uiInput, inputWriter := testInputMap(t, map[string]string{
 			"approve-provider-test-1.2.3": "no",
 		})
 
@@ -4858,6 +5127,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 				Providers: map[addrs.Provider]providers.Factory{
 					mockProviderAddress: providers.FactoryFixed(mockProvider),
 				},
+				UIInput: uiInput,
 			},
 			ProviderSource: source,
 		}
@@ -4941,12 +5211,13 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 		}
 
 		// Init number 1 - reject the provider
-		_ = testInputMap(t, map[string]string{
+		uiInput, _ := testInputMap(t, map[string]string{
 			"approve-provider-test-1.2.3": "no",
 		})
 		args := []string{
 			"-enable-pluggable-state-storage-experiment=true",
 		}
+		c.Meta.testingOverrides.UIInput = uiInput
 		code := c.Run(args)
 		testOutput := done(t)
 		if code != 1 {
@@ -4983,7 +5254,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 		}
 
 		// Init number 2 - re-prompted for approval
-		_ = testInputMap(t, map[string]string{
+		uiInput, _ = testInputMap(t, map[string]string{
 			"approve-provider-test-1.2.3": "yes",
 		})
 		args = []string{
@@ -4991,6 +5262,7 @@ func TestInit_stateStore_newWorkingDir_interactiveProviderApproval(t *testing.T)
 		}
 		ui = testUiWrapped(t)
 		view, done = testView(t)
+		c.Meta.testingOverrides.UIInput = uiInput
 		c.Ui = ui
 		c.View = view
 		code = c.Run(args)
@@ -5534,6 +5806,12 @@ func TestInit_stateStore_reconfigureLeadingToMigrationOfLocalState(t *testing.T)
 	mockProvider.MockStates = testing_provider.NewMockStateBytesWithStateIds("test_store", []string{"default"})
 	mockProviderAddress := addrs.NewDefaultProvider("test")
 
+	// Allow the test to respond to the pause in provider installation for
+	// checking the state storage provider.
+	uiInput, _ := testInputMap(t, map[string]string{
+		"backend-migrate-copy-to-empty": "yes",
+	})
+
 	ui := testUiWrapped(t)
 	view, done := testView(t)
 	meta := Meta{
@@ -5544,6 +5822,7 @@ func TestInit_stateStore_reconfigureLeadingToMigrationOfLocalState(t *testing.T)
 			Providers: map[addrs.Provider]providers.Factory{
 				mockProviderAddress: providers.FactoryFixed(mockProvider),
 			},
+			UIInput: uiInput,
 		},
 		ProviderSource: source,
 	}
@@ -5551,16 +5830,11 @@ func TestInit_stateStore_reconfigureLeadingToMigrationOfLocalState(t *testing.T)
 		Meta: meta,
 	}
 
-	// Allow the test to respond to the pause in provider installation for
-	// checking the state storage provider.
-	_ = testInputMap(t, map[string]string{
-		"backend-migrate-copy-to-empty": "yes",
-	})
-
 	args := []string{
 		"-reconfigure",
 		"-enable-pluggable-state-storage-experiment",
 	}
+
 	code := c.Run(args)
 	testOutput := done(t)
 	if code != 0 {
@@ -8357,10 +8631,16 @@ func mockPluggableStateStorageProvider(schemas map[string]providers.Schema) *tes
 			StateStores:       schemas,
 		},
 	}
+	return addPluggableStateStoreToMockProvider(&mock, schemas)
+}
+
+func addPluggableStateStoreToMockProvider(p *testing_provider.MockProvider, schemas map[string]providers.Schema) *testing_provider.MockProvider {
+	p.GetProviderSchemaResponse.StateStores = schemas
+
 	typeNames := slices.Sorted(maps.Keys(schemas))
-	mock.MockStates = testing_provider.NewMockStateBytesWithTypes(typeNames)
-	mock.GetStatesFn = func(req providers.GetStatesRequest) (resp providers.GetStatesResponse) {
-		stateIds, err := mock.MockStates.StateIds(req.TypeName)
+	p.MockStates = testing_provider.NewMockStateBytesWithTypes(typeNames)
+	p.GetStatesFn = func(req providers.GetStatesRequest) (resp providers.GetStatesResponse) {
+		stateIds, err := p.MockStates.StateIds(req.TypeName)
 		if err != nil {
 			resp.Diagnostics = resp.Diagnostics.Append(err)
 		}
@@ -8368,24 +8648,24 @@ func mockPluggableStateStorageProvider(schemas map[string]providers.Schema) *tes
 
 		return resp
 	}
-	mock.ConfigureStateStoreFn = func(req providers.ConfigureStateStoreRequest) providers.ConfigureStateStoreResponse {
+	p.ConfigureStateStoreFn = func(req providers.ConfigureStateStoreRequest) providers.ConfigureStateStoreResponse {
 		return providers.ConfigureStateStoreResponse{
 			Capabilities: providers.StateStoreServerCapabilities{
 				ChunkSize: 1234, // arbitrary number that isn't 0
 			},
 		}
 	}
-	mock.WriteStateBytesFn = func(req providers.WriteStateBytesRequest) (resp providers.WriteStateBytesResponse) {
+	p.WriteStateBytesFn = func(req providers.WriteStateBytesRequest) (resp providers.WriteStateBytesResponse) {
 		// Workspaces exist once the artefact representing it is written
-		err := mock.MockStates.Write(req.TypeName, req.StateId, req.Bytes)
+		err := p.MockStates.Write(req.TypeName, req.StateId, req.Bytes)
 		if err != nil {
 			resp.Diagnostics = resp.Diagnostics.Append(err)
 		}
 
 		return resp
 	}
-	mock.ReadStateBytesFn = func(req providers.ReadStateBytesRequest) (resp providers.ReadStateBytesResponse) {
-		b, err := mock.MockStates.Read(req.TypeName, req.StateId)
+	p.ReadStateBytesFn = func(req providers.ReadStateBytesRequest) (resp providers.ReadStateBytesResponse) {
+		b, err := p.MockStates.Read(req.TypeName, req.StateId)
 		if err != nil {
 			if errors.Is(err, testing_provider.StateNotFoundErr{TypeName: req.TypeName, StateId: req.StateId}) {
 				warn := tfdiags.SimpleWarning(err.Error())
@@ -8398,14 +8678,14 @@ func mockPluggableStateStorageProvider(schemas map[string]providers.Schema) *tes
 
 		return resp
 	}
-	mock.DeleteStateFn = func(req providers.DeleteStateRequest) (resp providers.DeleteStateResponse) {
-		err := mock.MockStates.Delete(req.TypeName, req.StateId)
+	p.DeleteStateFn = func(req providers.DeleteStateRequest) (resp providers.DeleteStateResponse) {
+		err := p.MockStates.Delete(req.TypeName, req.StateId)
 		if err != nil {
 			resp.Diagnostics = resp.Diagnostics.Append(err)
 		}
 		return resp
 	}
-	return &mock
+	return p
 }
 
 func assertLockfileContents(t *testing.T, path string, expected string) {

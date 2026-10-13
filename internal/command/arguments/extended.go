@@ -63,14 +63,21 @@ type Operation struct {
 	// state before proceeding. Default is true.
 	Refresh bool
 
+	// MinimalRefresh will run an initial plan for each resource prior to refreshing:
+	//   - If the plan indicates a no-op, then the no-op plan will be returned without refreshing the resource.
+	//   - If the plan indicates a change (anything but no-op), then the resource will be refreshed and another plan will be run.
+	//
+	// Default is false.
+	MinimalRefresh bool
+
 	// Targets allow limiting an operation to a set of resource addresses and
 	// their dependencies.
-	Targets []addrs.Targetable
+	Targets []addrs.TargetPattern
 
 	// ActionTargets means we should just invoke the actions specified here, and
 	// not run a complete plan. Targets and ActionTargets are mutually exclusive
 	// and this should only be set for plan and apply operations.
-	ActionTargets []addrs.Targetable
+	ActionTargets []addrs.TargetPattern
 
 	// ForceReplace addresses cause Terraform to force a particular set of
 	// resource instances to generate "replace" actions in any plan where they
@@ -107,15 +114,15 @@ type Operation struct {
 }
 
 // Parse must be called on Operation after initial flag parse. This processes
-// the raw target flags into addrs.Targetable values, returning diagnostics if
-// invalid.
+// the raw target flags into addrs.TargetPattern values, returning diagnostics
+// if invalid.
 func (o *Operation) Parse() tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
 	o.Targets = nil
 
 	for _, tr := range o.targetsRaw {
-		traversal, syntaxDiags := hclsyntax.ParseTraversalAbs([]byte(tr), "", hcl.Pos{Line: 1, Column: 1})
+		traversal, syntaxDiags := hclsyntax.ParseTraversalPartial([]byte(tr), "", hcl.Pos{Line: 1, Column: 1})
 		if syntaxDiags.HasErrors() {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
@@ -135,11 +142,11 @@ func (o *Operation) Parse() tfdiags.Diagnostics {
 			continue
 		}
 
-		o.Targets = append(o.Targets, target.Subject)
+		o.Targets = append(o.Targets, target)
 	}
 
 	for _, tr := range o.actionTargetsRaw {
-		traversal, syntaxDiags := hclsyntax.ParseTraversalAbs([]byte(tr), "", hcl.Pos{Line: 1, Column: 1})
+		traversal, syntaxDiags := hclsyntax.ParseTraversalPartial([]byte(tr), "", hcl.Pos{Line: 1, Column: 1})
 		if syntaxDiags.HasErrors() {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
@@ -159,7 +166,7 @@ func (o *Operation) Parse() tfdiags.Diagnostics {
 			continue
 		}
 
-		o.ActionTargets = append(o.ActionTargets, target.Subject)
+		o.ActionTargets = append(o.ActionTargets, target)
 	}
 
 	if len(o.ActionTargets) > 1 {
@@ -230,6 +237,22 @@ func (o *Operation) Parse() tfdiags.Diagnostics {
 		}
 	}
 
+	if o.MinimalRefresh && o.PlanMode != plans.NormalMode && o.PlanMode != plans.DestroyMode {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Incompatible plan mode options",
+			fmt.Sprintf("The -minimal-refresh option can only be used in normal or destroy planning modes, but the current mode is %s.", o.PlanMode),
+		))
+	}
+
+	if o.MinimalRefresh && !o.Refresh {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Incompatible refresh options",
+			"The -minimal-refresh and -refresh=false options are mutually-exclusive, because -minimal-refresh only affects whether Terraform refreshes.",
+		))
+	}
+
 	return diags
 }
 
@@ -257,6 +280,7 @@ func extendedFlagSet(name string, state *State, operation *Operation, vars *Vars
 		f.BoolVar(&operation.Refresh, "refresh", true, "refresh")
 		f.BoolVar(&operation.destroyRaw, "destroy", false, "destroy")
 		f.BoolVar(&operation.refreshOnlyRaw, "refresh-only", false, "refresh-only")
+		f.BoolVar(&operation.MinimalRefresh, "minimal-refresh", false, "minimal-refresh")
 		f.Var((*FlagStringSlice)(&operation.targetsRaw), "target", "target")
 		f.Var((*FlagStringSlice)(&operation.actionTargetsRaw), "invoke", "invoke")
 		f.Var((*FlagStringSlice)(&operation.forceReplaceRaw), "replace", "replace")

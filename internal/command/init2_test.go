@@ -8,6 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/terraform/internal/command/views"
+	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/modsdir"
+	"github.com/hashicorp/terraform/internal/terminal"
 )
 
 func TestInit2_dynamicSourceErrors(t *testing.T) {
@@ -204,6 +209,76 @@ func TestInit2_dynamicSourceSuccess(t *testing.T) {
 			testOutput := done(t)
 			if code != 0 {
 				t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+			}
+		})
+	}
+}
+
+func TestInit2_dynamicSourceInTestModule(t *testing.T) {
+	tests := map[string]struct {
+		fixture     string
+		args        []string
+		manifestKey string
+	}{
+		"required variable": {
+			fixture:     "test-module-required-variable",
+			args:        []string{"-var", "module_src=../modules/simple"},
+			manifestKey: "test.main.dynamic_source.const_var_source",
+		},
+		"module in same directory": {
+			fixture:     "test-module-same-directory",
+			manifestKey: "test.main.dynamic_source.const_var_source",
+		},
+		"local value": {
+			fixture:     "test-module-local-value",
+			manifestKey: "test.main.dynamic_source.const_var_source",
+		},
+		"nested test file": {
+			fixture:     "test-module-nested-test-file",
+			manifestKey: "test.tests.dynamic.dynamic_source.const_var_source",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			td := t.TempDir()
+			testCopyDir(t, testFixturePath(filepath.Join("dynamic-module-sources", tc.fixture)), td)
+			t.Chdir(td)
+
+			streams, done := terminal.StreamsForTesting(t)
+			meta := Meta{
+				Ui:      testUiWrapped(t),
+				View:    views.NewView(streams),
+				Streams: streams,
+			}
+
+			init := &InitCommand{Meta: meta}
+			if code := init.Run(tc.args); code != 0 {
+				output := done(t)
+				t.Fatalf("init failed with exit status %d\nstderr:\n%s\n\nstdout:\n%s", code, output.Stderr(), output.Stdout())
+			}
+			done(t)
+
+			manifest, err := modsdir.ReadManifestSnapshotForDir(filepath.Join(td, ".terraform", "modules"))
+			if err != nil {
+				t.Fatalf("failed to read module manifest: %s", err)
+			}
+			if _, exists := manifest[tc.manifestKey]; !exists {
+				t.Errorf("module manifest does not contain %q", tc.manifestKey)
+			}
+
+			streams, done = terminal.StreamsForTesting(t)
+			meta.Streams = streams
+			meta.View = views.NewView(streams)
+
+			test := &TestCommand{Meta: meta}
+			code := test.Run(append(tc.args, "-no-color"))
+			output := done(t)
+			if code != 0 {
+				t.Fatalf("test failed with exit status %d\nstderr:\n%s\n\nstdout:\n%s", code, output.Stderr(), output.Stdout())
+			}
+			if !strings.Contains(output.Stdout(), "1 passed, 0 failed.") {
+				t.Fatalf("expected test to pass, got:\n%s", output.Stdout())
 			}
 		})
 	}
@@ -684,6 +759,165 @@ func TestPlan_dynamicModuleSourceWithForEach(t *testing.T) {
 	}
 }
 
+func TestInit2_dynamicProviderSourceErrors(t *testing.T) {
+	tests := map[string]struct {
+		fixture   string
+		args      []string
+		wantError string
+	}{
+		"non-const variable in provider source": {
+			fixture:   "provider-source-with-non-const-variable",
+			args:      []string{"-var", "provider_src=hashicorp/test"},
+			wantError: "Unknown provider source",
+		},
+		"non-const variable in provider version": {
+			fixture:   "provider-version-with-non-const-variable",
+			args:      []string{"-var", "provider_ver=1.0.0"},
+			wantError: "Unknown provider version",
+		},
+		"resource reference in provider source": {
+			fixture:   "provider-source-with-resource-reference",
+			wantError: "Invalid provider source",
+		},
+		"required const variable not set": {
+			fixture:   "provider-source-with-variable-no-value",
+			wantError: "No value for required variable",
+		},
+		"invalid provider source after evaluation": {
+			fixture:   "provider-source-invalid-after-eval",
+			args:      []string{"-var", "provider_src=!!!invalid"},
+			wantError: "Invalid provider type",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			td := t.TempDir()
+			testCopyDir(t, testFixturePath(filepath.Join("dynamic-provider-sources", tc.fixture)), td)
+			t.Chdir(td)
+
+			providerSource := newMockProviderSource(t, map[string][]string{
+				"hashicorp/test": {"1.0.0"},
+			})
+
+			ui := testUiWrapped(t)
+			view, done := testView(t)
+			c := &InitCommand{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(testProvider()),
+					Ui:               ui,
+					View:             view,
+					ProviderSource:   providerSource,
+				},
+			}
+
+			code := c.Run(tc.args)
+			testOutput := done(t)
+			if code != 1 {
+				t.Fatalf("got exit status %d; want 1\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+			}
+
+			if tc.wantError != "" {
+				got := testOutput.All()
+				if !strings.Contains(got, tc.wantError) {
+					t.Fatalf("wrong error\ngot:\n%s\n\nwant: containing %q", got, tc.wantError)
+				}
+			}
+		})
+	}
+}
+
+func TestInit2_dynamicProviderSourceSuccess(t *testing.T) {
+	tests := map[string]struct {
+		fixture   string
+		args      []string
+		providers map[string][]string
+	}{
+		"const variable via -var": {
+			fixture: "provider-source-with-variable",
+			args:    []string{"-var", "provider_src=hashicorp/test"},
+		},
+		"const variable for source and version": {
+			fixture: "provider-source-and-version-with-variables",
+			args:    []string{"-var", "provider_src=hashicorp/test", "-var", "provider_ver=1.0.0"},
+		},
+		"const variable with default value": {
+			fixture: "provider-source-with-variable-default",
+		},
+		"string interpolation in provider source": {
+			fixture: "provider-source-with-interpolation",
+			args:    []string{"-var", "provider_ns=hashicorp"},
+		},
+		"local value referencing const variable": {
+			fixture: "provider-source-with-local-value",
+			args:    []string{"-var", "provider_src=hashicorp/test"},
+		},
+		"const variable from tfvars file": {
+			fixture: "provider-source-with-varsfile",
+			args:    []string{"-var-file", "test.tfvars"},
+		},
+		"mixed static and dynamic providers": {
+			fixture: "provider-source-mixed-static-dynamic",
+			args:    []string{"-var", "dyn_src=hashicorp/dynamic"},
+			providers: map[string][]string{
+				"hashicorp/dynamic": {"1.0.0"},
+				"hashicorp/static":  {"1.0.0"},
+			},
+		},
+		"child module with dynamic provider source": {
+			fixture: "provider-source-in-child-module",
+			args:    []string{"-var", "provider_src=hashicorp/test"},
+		},
+		"const with extra resource": {
+			fixture: "provider-source-with-resources",
+			args:    []string{},
+			providers: map[string][]string{
+				"hashicorp2/test": {"1.0.0"},
+			},
+		},
+		"const with extra resource and provider local name": {
+			fixture: "provider-source-with-resources-and-provider-local-name",
+			args:    []string{},
+			providers: map[string][]string{
+				"hashicorp2/test": {"1.0.0"},
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			td := t.TempDir()
+			testCopyDir(t, testFixturePath(filepath.Join("dynamic-provider-sources", tc.fixture)), td)
+			t.Chdir(td)
+
+			providers := tc.providers
+			if providers == nil {
+				providers = map[string][]string{
+					"hashicorp/test": {"1.0.0"},
+				}
+			}
+			providerSource := newMockProviderSource(t, providers)
+
+			ui := testUiWrapped(t)
+			view, done := testView(t)
+			c := &InitCommand{
+				Meta: Meta{
+					testingOverrides: metaOverridesForProvider(testProvider()),
+					Ui:               ui,
+					View:             view,
+					ProviderSource:   providerSource,
+				},
+			}
+
+			code := c.Run(tc.args)
+			testOutput := done(t)
+			if code != 0 {
+				t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+			}
+		})
+	}
+}
+
 func TestPlan_dynamicModuleVersionMismatch(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(filepath.Join("dynamic-module-sources", "plan-with-version-mismatch")), td)
@@ -714,5 +948,124 @@ func TestPlan_dynamicModuleVersionMismatch(t *testing.T) {
 	want := "Module version requirements have changed"
 	if !strings.Contains(got, want) {
 		t.Fatalf("wrong error\ngot:\n%s\n\nwant: containing %q", got, want)
+	}
+}
+
+func TestPrimaryWorkflow_dynamicProviderSource_pluggableStateStorage(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(filepath.Join("dynamic-provider-sources", "combined-with-pluggable-state-storage")), td)
+	t.Chdir(td)
+
+	mockProvider := mockPluggableStateStorageProvider(mockSingleStateStoreSchema("test_store"))
+	// Make the mock provider have an empty schema body, matching the mock used below for the query command.
+	// Without this, Terraform will detect the change in the provider schema and think the state store configuration has changed.
+	mockProvider.GetProviderSchemaResponse.Provider.Body = &configschema.Block{
+		Attributes: map[string]*configschema.Attribute{},
+		BlockTypes: map[string]*configschema.NestedBlock{},
+	}
+	providerSource := newMockProviderSource(t, map[string][]string{
+		"hashicorp/test": {"1.0.0"},
+	})
+
+	varArgs := []string{
+		"-var", "provider_source=registry.terraform.io/hashicorp/test",
+		"-var", "provider_version=1.0.0",
+	}
+
+	// INIT
+	ui := testUiWrapped(t)
+	view, done := testView(t)
+	initCmd := &InitCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(mockProvider),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+
+	code := initCmd.Run(append([]string{"-enable-pluggable-state-storage-experiment"}, varArgs...))
+	testOutput := done(t)
+	if code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+	}
+	expectedMsg := `Finding hashicorp/test versions matching "1.0.0"...`
+	if !strings.Contains(testOutput.All(), expectedMsg) {
+		t.Fatalf("expected output to contain %q\n, got:\n%s", expectedMsg, testOutput.All())
+	}
+
+	// PLAN
+	ui = testUiWrapped(t)
+	view, done = testView(t)
+	planCmd := &PlanCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(mockProvider),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+	code = planCmd.Run(varArgs)
+	testOutput = done(t)
+	if code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+	}
+
+	// APPLY
+	ui = testUiWrapped(t)
+	view, done = testView(t)
+	applyCmd := &ApplyCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(mockProvider),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+	code = applyCmd.Run(append([]string{"-auto-approve"}, varArgs...))
+	testOutput = done(t)
+	if code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+	}
+
+	// REFRESH
+	ui = testUiWrapped(t)
+	view, done = testView(t)
+	refreshCmd := &RefreshCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(mockProvider),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+	code = refreshCmd.Run(varArgs)
+	testOutput = done(t)
+	if code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
+	}
+
+	// QUERY
+	queryMockProvider := queryFixtureProvider()
+	queryMockProvider = addPluggableStateStoreToMockProvider(queryMockProvider, mockSingleStateStoreSchema("test_store")) // Update the query-specific mock to also include a state store.
+	ui = testUiWrapped(t)
+	view, done = testView(t)
+	queryCmd := &QueryCommand{
+		Meta: Meta{
+			testingOverrides:          metaOverridesForProvider(queryMockProvider),
+			Ui:                        ui,
+			View:                      view,
+			ProviderSource:            providerSource,
+			AllowExperimentalFeatures: true,
+		},
+	}
+	code = queryCmd.Run(varArgs)
+	testOutput = done(t)
+	if code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, testOutput.Stderr(), testOutput.Stdout())
 	}
 }

@@ -76,6 +76,8 @@ func (b *Cloud) opApply(stopCtx, cancelCtx context.Context, op *backendrun.Opera
 		))
 	}
 
+	diags = diags.Append(b.checkMinimalRefreshAPIVersion(op))
+
 	// Return if there are any errors.
 	if diags.HasErrors() {
 		return &RunResult{}, diags.Err()

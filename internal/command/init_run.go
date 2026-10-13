@@ -79,7 +79,6 @@ func (c *InitCommand) run(initArgs *arguments.Init, view views.Init) int {
 		view.LogConfigurationCopyingStart(src)
 
 		hooks := uiModuleInstallHooks{
-			Ui:             c.Ui,
 			ShowLocalPaths: false, // since they are in a weird location for init
 			View:           view,
 		}
@@ -110,7 +109,7 @@ func (c *InitCommand) run(initArgs *arguments.Init, view views.Init) int {
 		return 1
 	}
 	if empty {
-		view.Output(views.OutputInitEmptyMessage)
+		view.LogInitSuccessEmpty()
 		return 0
 	}
 
@@ -286,7 +285,7 @@ Please use \"terraform state migrate -upgrade\" to upgrade the state store provi
 	if len(initArgs.PolicyPaths) > 0 {
 		var policyDiags policy.Diagnostics
 		var stopClient func()
-		policyClient, policyDiags, stopClient = c.PolicyClient(ctx, initArgs.PolicyPaths, backendPolicyEntitlement(back))
+		policyClient, policyDiags, stopClient = c.PolicyClient(ctx, initArgs.PolicyPaths, backendPolicyEntitlement(back, policy.InitEvaluationStage))
 		defer stopClient()
 		// Stream any policy setup diagnostics (e.g. a failure to connect to the
 		// policy engine).
@@ -446,22 +445,21 @@ Please use \"terraform state migrate -upgrade\" to upgrade the state store provi
 	// still the final thing shown.
 	view.Diagnostics(diags)
 	_, cloud := back.(*cloud.Cloud)
-	output := views.OutputInitSuccessMessage
 	if cloud {
-		output = views.OutputInitSuccessCloudMessage
+		view.LogInitSuccessCloud()
+	} else {
+		view.LogInitSuccess()
 	}
-
-	view.Output(output)
 
 	if !c.RunningInAutomation {
 		// If we're not running in an automation wrapper, give the user
 		// some more detailed next steps that are appropriate for interactive
 		// shell usage.
-		output = views.OutputInitSuccessCLIMessage
 		if cloud {
-			output = views.OutputInitSuccessCLICloudMessage
+			view.LogCallToActionCLICloud()
+		} else {
+			view.LogCallToActionCLI()
 		}
-		view.Output(output)
 	}
 	return 0
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/internal/policy"
@@ -39,9 +40,8 @@ func TestApply_WithPolicyDiagnosticsJSON(t *testing.T) {
 	overrides.PolicyClient = policyClient
 	c := &ApplyCommand{
 		Meta: Meta{
-			testingOverrides:          overrides,
-			View:                      view,
-			AllowExperimentalFeatures: true,
+			testingOverrides: overrides,
+			View:             view,
 		},
 	}
 	resp := policy.EvaluationFromProtoResponse(
@@ -135,7 +135,10 @@ func TestApply_WithPolicyDiagnosticsJSON(t *testing.T) {
 	}
 
 	args := []string{"-policies", td}
-	code := c.Run(append(args, "-no-color", "-json", "-auto-approve"))
+	var code int
+	synctest.Test(t, func(t *testing.T) {
+		code = c.Run(append(args, "-no-color", "-json", "-auto-approve"))
+	})
 	output := done(t)
 	if code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, output.Stdout())
@@ -176,9 +179,8 @@ func TestApply_PolicyResultsJSON_WithSavedPlan(t *testing.T) {
 	planOverrides.PolicyClient = policy.NewTestMockClient(t)
 	planCmd := &PlanCommand{
 		Meta: Meta{
-			testingOverrides:          planOverrides,
-			View:                      planView,
-			AllowExperimentalFeatures: true,
+			testingOverrides: planOverrides,
+			View:             planView,
 		},
 	}
 	if code := planCmd.Run([]string{"-policies", td, "-no-color", "-out=planfile"}); code != 0 {
@@ -193,9 +195,8 @@ func TestApply_PolicyResultsJSON_WithSavedPlan(t *testing.T) {
 	applyOverrides.PolicyClient = applyPolicyClient
 	applyCmd := &ApplyCommand{
 		Meta: Meta{
-			testingOverrides:          applyOverrides,
-			View:                      applyView,
-			AllowExperimentalFeatures: true,
+			testingOverrides: applyOverrides,
+			View:             applyView,
 		},
 	}
 
@@ -264,7 +265,10 @@ func TestApply_PolicyResultsJSON_WithSavedPlan(t *testing.T) {
 		})
 	applyPolicyClient.EvaluateResponse = &resp
 
-	code := applyCmd.Run([]string{"-policies", td, "-no-color", "-json", "-auto-approve", "planfile"})
+	var code int
+	synctest.Test(t, func(t *testing.T) {
+		code = applyCmd.Run([]string{"-policies", td, "-no-color", "-json", "-auto-approve", "planfile"})
+	})
 	output := applyDone(t)
 	if code != 0 {
 		t.Fatalf("apply failed: %d\n\n%s", code, output.All())
@@ -314,9 +318,8 @@ func TestApply_WithPolicyClientStopAfterApply(t *testing.T) {
 	overrides.PolicyClient = policyClient
 	c := &ApplyCommand{
 		Meta: Meta{
-			testingOverrides:          overrides,
-			View:                      view,
-			AllowExperimentalFeatures: true,
+			testingOverrides: overrides,
+			View:             view,
 		},
 	}
 
@@ -357,9 +360,8 @@ func TestApply_WithPlanPolicyDiagnosticsJSON(t *testing.T) {
 	overrides.PolicyClient = policyClient
 	c := &ApplyCommand{
 		Meta: Meta{
-			testingOverrides:          overrides,
-			View:                      view,
-			AllowExperimentalFeatures: true,
+			testingOverrides: overrides,
+			View:             view,
 		},
 	}
 	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) (resp providers.PlanResourceChangeResponse) {
@@ -467,7 +469,10 @@ func TestApply_WithPlanPolicyDiagnosticsJSON(t *testing.T) {
 	}
 
 	args := []string{"-policies", td}
-	code := c.Run(append(args, "-no-color", "-json", "-auto-approve"))
+	var code int
+	synctest.Test(t, func(t *testing.T) {
+		code = c.Run(append(args, "-no-color", "-json", "-auto-approve"))
+	})
 	output := done(t)
 	if code != 0 {
 		t.Fatalf("bad: %d\n\n%s", code, output.Stdout())

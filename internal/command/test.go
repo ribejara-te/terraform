@@ -298,6 +298,9 @@ func (m *Meta) setupTestExecution(mode moduletest.CommandMode, command string, r
 	view := views.NewTest(preparation.Args.ViewType, m.View)
 	preparation.View = view
 
+	// Log version output
+	view.Version()
+
 	// EXPERIMENTAL: maybe enable deferred actions
 	if !m.AllowExperimentalFeatures && preparation.Args.DeferralAllowed {
 		diags = diags.Append(tfdiags.Sourceless(
@@ -358,7 +361,7 @@ func (m *Meta) setupTestExecution(mode moduletest.CommandMode, command string, r
 	// We do an early load of just the root module to discover which
 	// variables are const. We discard non-error diagnostics from this
 	// early load since loadConfigWithTests will re-parse and report them.
-	earlyMod, earlyDiags := m.loadSingleModuleWithTests(".", preparation.Args.TestDirectory)
+	earlyMod, earlyDiags := m.loadRawModule(".")
 	if earlyDiags.HasErrors() {
 		diags = diags.Append(earlyDiags)
 		view.Diagnostics(nil, nil, diags)
